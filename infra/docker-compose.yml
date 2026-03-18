@@ -1,0 +1,163 @@
+# Cortex Hub — Docker Compose Stack
+# Services: Qdrant, Neo4j Community, mem0, Dashboard API
+# GitNexus runs natively (not Dockerized) — requires system-level git access
+
+services:
+  # ─────────────────────────────────────────────
+  # Qdrant — Vector Database
+  # ─────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    container_name: cortex-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────
+  # Neo4j Community — Graph Database (for mem0)
+  # ─────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    container_name: cortex-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP Browser
+      - "7687:7687"   # Bolt protocol
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-cortex2026}
+      NEO4J_PLUGINS: '[]'
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+    healthcheck:
+      test: ["CMD", "neo4j-admin", "server", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────
+  # mem0 — Agent Memory Service
+  # ─────────────────────────────────────────────
+  mem0:
+    image: mem0/mem0:latest
+    container_name: cortex-mem0
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    environment:
+      MEM0_API_KEY: ${MEM0_API_KEY:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      MEM0_VECTOR_STORE: qdrant
+      MEM0_QDRANT_HOST: qdrant
+      MEM0_QDRANT_PORT: 6333
+      MEM0_GRAPH_STORE: neo4j
+      MEM0_NEO4J_URL: bolt://neo4j:7687
+      MEM0_NEO4J_USERNAME: neo4j
+      MEM0_NEO4J_PASSWORD: ${NEO4J_PASSWORD:-cortex2026}
+      MEM0_EMBEDDER: openai
+      MEM0_EMBEDDING_MODEL: text-embedding-3-small
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8050/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ─────────────────────────────────────────────
+  # Dashboard API (Hono + SQLite)
+  # ─────────────────────────────────────────────
+  dashboard-api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.dashboard-api
+    container_name: cortex-dashboard-api
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - api-data:/app/data
+    environment:
+      PORT: 4000
+      NODE_ENV: production
+      DATABASE_PATH: /app/data/cortex.db
+      QDRANT_URL: http://qdrant:6333
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-cortex2026}
+      MEM0_URL: http://mem0:8050
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────
+  # Watchtower — Auto-update containers
+  # ─────────────────────────────────────────────
+  watchtower:
+    image: containrrr/watchtower
+    container_name: cortex-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: 86400
+      WATCHTOWER_LABEL_ENABLE: "false"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  qdrant-data:
+    name: cortex-qdrant-data
+  neo4j-data:
+    name: cortex-neo4j-data
+  neo4j-logs:
+    name: cortex-neo4j-logs
+  api-data:
+    name: cortex-api-data
