@@ -1,0 +1,19 @@
+/**
+ * Cloudflare Worker environment bindings.
+ * These correspond to [vars] in wrangler.toml.
+ */
+interface Env {
+  // Backend service URLs (via Cloudflare Tunnel)
+  QDRANT_URL: string
+  NEO4J_URL: string
+  MEM0_URL: string
+  CLIPROXY_URL: string
+  DASHBOARD_API_URL: string
+
+  // MCP Server metadata
+  MCP_SERVER_NAME: string
+  MCP_SERVER_VERSION: string
+
+  // Auth (comma-separated API keys)
+  API_KEYS: string
+}

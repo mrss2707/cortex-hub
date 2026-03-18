@@ -1,0 +1,23 @@
+# Cortex Hub MCP Server
+name = "cortex-hub-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Enable workers.dev subdomain
+workers_dev = true
+
+# Custom domain route (jackle.dev zone must be on this CF account)
+# routes = [{ pattern = "mcp.hub.jackle.dev", custom_domain = true }]
+
+[vars]
+# Backend service URLs (via Cloudflare Tunnel → server)
+QDRANT_URL = "https://qdrant.hub.jackle.dev"
+NEO4J_URL = "https://neo4j.hub.jackle.dev"
+MEM0_URL = "https://mem0.hub.jackle.dev"
+CLIPROXY_URL = "https://llm.hub.jackle.dev"
+DASHBOARD_API_URL = "https://api.hub.jackle.dev"
+
+# MCP Server metadata
+MCP_SERVER_NAME = "cortex-hub"
+MCP_SERVER_VERSION = "0.1.0"
