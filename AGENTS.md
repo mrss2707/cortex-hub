@@ -1,8 +1,8 @@
 # Cortex Hub — Agent Guidelines
 
-> **Current Phase:** 4 (Hub MCP Server) ✅ — Ready for Phase 5
+> **Current Phase:** 5 (Dashboard Frontend) ✅ — Ready for Phase 6
 > **Engagement:** Express | **Mode:** Greenfield
-> **Last Gate Passed:** Gate 3 (Phase 3→4) on 2026-03-18
+> **Last Gate Passed:** Gate 4 (Phase 4→5) on 2026-03-18
 
 ---
 
@@ -31,13 +31,14 @@ Cortex Hub is a self-hosted, MCP-compliant platform that unifies code intelligen
 ## Phase Roadmap & Gates
 
 ### Completed Phases
+### Completed Phases
 - [x] **Phase 1:** Server + Cloudflare Tunnel
 - [x] **Phase 2:** Monorepo skeleton + shared packages
 - [x] **Phase 3:** Docker stack (Qdrant, Neo4j, mem0, CLIProxy, Watchtower)
 - [x] **Phase 4:** Hub MCP Server (Cloudflare Worker) — `apps/hub-mcp`
+- [x] **Phase 5:** Dashboard Frontend (Next.js) — `apps/dashboard-web`
 
 ### Upcoming Phases
-- [ ] **Phase 5:** Dashboard Frontend (Next.js) — `apps/dashboard-web`
 - [ ] **Phase 6:** Polish, docs, testing, GA release
 
 ### Gate Criteria
