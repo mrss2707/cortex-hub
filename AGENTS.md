@@ -10,9 +10,10 @@
 
 ### At Session Start — ALWAYS do:
 
-1. **Read `STATE.md`** → current phase, active tasks, recent decisions
-2. **Read `.forgewright/project-profile.json`** → `verify` commands, patterns, fingerprint
-3. **Acknowledge context:** "Phase X, resuming: [task]. Verify: [commands from profile]"
+1. **Read `STATE.md`** → current task & progress
+2. **Read `.forgewright/project-profile.json`** → `verify` commands & fingerprint
+3. **Run `/onboard`** (if first session) → sync MCP, rules, and local audit
+4. **Acknowledge context:** "Phase X, resuming: [task]. Standards: SOLID, Clean Architecture. Verify: [profile commands]"
 
 ### At Session End — ALWAYS do:
 
@@ -63,6 +64,7 @@ Cortex Hub is a self-hosted, MCP-compliant platform that unifies code intelligen
 | "add X" / "implement X" / "thêm X" / "làm X" | Feature | Read profile → PLAN → get approval → EXECUTE → VERIFY |
 | "fix X" / "sửa X" / "debug X" | Debug | Locate issue → fix → run verify.pre_commit |
 | "deploy" / "ship" / "đẩy lên" | Deploy | Run verify.full → deploy from profile → verify live |
+| "onboard" / "setup" / "cài đặt" | Setup | Run scripts/onboard.sh or scripts/install-hub.sh |
 | "review" / "check" / "kiểm tra" | Review | Run verify.full → check conventions → report |
 
 ---

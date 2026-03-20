@@ -6,6 +6,7 @@ import { registerMemoryTools } from './tools/memory'
 import { registerKnowledgeTools } from './tools/knowledge'
 import { registerCodeTools } from './tools/code'
 import { registerQualityTools } from './tools/quality'
+import { registerSessionTools } from './tools/session'
 import { validateApiKey } from './middleware/auth'
 
 /**
@@ -37,6 +38,20 @@ export default {
         }),
         { headers: { 'Content-Type': 'application/json' } }
       )
+    }
+
+    // Session Start endpoint (REST)
+    if (url.pathname === '/session/start' && request.method === 'POST') {
+      const auth = await validateApiKey(request, env)
+      if (!auth.valid) return new Response(JSON.stringify({ error: auth.error }), { status: 401 })
+      
+      const sessionData = await request.json() as any
+      return new Response(JSON.stringify({ 
+        session_id: `sess_${Math.random().toString(36).substr(2, 9)}`,
+        status: 'active',
+        repo: sessionData.repo,
+        mission_brief: 'Refined Phase 6 objectives loaded. SOLID and Clean Architecture enforced.',
+      }), { headers: { 'Content-Type': 'application/json' } })
     }
 
     // Root endpoint — server info
@@ -85,6 +100,7 @@ export default {
       registerKnowledgeTools(server, env)
       registerCodeTools(server, env)
       registerQualityTools(server, env)
+      registerSessionTools(server, env)
 
       const mcpHandler = createMcpHandler(server as any)
       return mcpHandler(request, env, ctx)

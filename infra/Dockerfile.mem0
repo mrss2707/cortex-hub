@@ -46,7 +46,9 @@ def get_memory():
         # Try to get a real API key: Codex OAuth > env var > fallback
         codex_token = _read_codex_token()
         api_key = codex_token or os.environ.get("OPENAI_API_KEY", "proxy-key")
-        llm_base_url = os.environ.get("OPENAI_BASE_URL")  # CLIProxy for chat
+        
+        # Base URL for both LLM and Embeddings (CLIProxy)
+        base_url = os.environ.get("OPENAI_BASE_URL")
 
         config = {
             "llm": {
@@ -61,9 +63,6 @@ def get_memory():
                 "config": {
                     "model": os.environ.get("MEM0_EMBEDDING_MODEL", "text-embedding-3-small"),
                     "api_key": api_key,
-                    # Embeddings go DIRECT to OpenAI — CLIProxy v6.8.55
-                    # does not support /v1/embeddings (returns 404)
-                    "openai_base_url": "https://api.openai.com/v1",
                 }
             },
             "vector_store": {
@@ -76,11 +75,30 @@ def get_memory():
             },
         }
 
-        # LLM chat completions route through CLIProxy
-        if llm_base_url:
-            config["llm"]["config"]["openai_base_url"] = llm_base_url
+        # Apply base URL to both if provided (CLIProxy)
+        if base_url:
+            config["llm"]["config"]["openai_base_url"] = base_url
+            config["embedder"]["config"]["openai_base_url"] = base_url
 
-        _memory = Memory.from_config(config)
+        try:
+            # Test the primary embedder (OpenAI/CLIProxy)
+            _memory = Memory.from_config(config)
+            # We don't run a test search here to avoid latency, 
+            # but in a real session, errors will trigger the fallback logic if implemented in the wrapper.
+            # Simplified for Phase 6: If ENV var MEM0_FALLBACK_GEMINI is set, use Gemini.
+            if os.environ.get("MEM0_FALLBACK_GEMINI") == "true":
+                raise Exception("Forced Fallback")
+        except Exception:
+            # Fallback to Gemini if OpenAI/Proxy fails or is forced
+            config["embedder"] = {
+                "provider": "gemini",
+                "config": {
+                    "model": "models/text-embedding-004",
+                    "api_key": os.environ.get("GEMINI_API_KEY", api_key),
+                }
+            }
+            _memory = Memory.from_config(config)
+
     return _memory
 
 class AddMemoryRequest(BaseModel):

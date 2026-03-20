@@ -100,6 +100,10 @@
       "dashboard-web": "cd apps/dashboard-web && pnpm build && npx wrangler pages deploy out --project-name cortex-hub --branch main",
       "hub-mcp": "cd apps/hub-mcp && npx wrangler deploy",
       "dashboard-api": "docker compose -f infra/docker-compose.yml build dashboard-api && docker compose up -d dashboard-api"
+    },
+    "setup": {
+      "install": "./scripts/install-hub.sh",
+      "onboard": "./scripts/onboard.sh"
     }
   },
   "forgewright": {
