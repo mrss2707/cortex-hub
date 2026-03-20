@@ -166,25 +166,58 @@ export async function startIndexing(projectId: string, jobId: string, branch: st
     updateJob(jobId, { progress: 70, symbols_found: symbolsFound, total_files: totalFiles })
     logger.info(`[${jobId}] GitNexus analyze complete: ${symbolsFound} symbols, ${totalFiles} files`)
 
-    // ── Step 3: mem0 Ingest ──
+    // ── Step 3: mem0 Ingest (branch-scoped) ──
     updateJob(jobId, { status: 'ingesting', progress: 80 })
-    logger.info(`[${jobId}] Ingesting to mem0`)
+    logger.info(`[${jobId}] Ingesting to mem0 (branch-scoped)`)
 
     try {
       const mem0Url = process.env.MEM0_URL ?? 'http://mem0:8000'
-      const summary = `Project ${project.id} indexed: ${symbolsFound} symbols across ${totalFiles} files from branch ${branch}. Repository: ${project.git_repo_url}`
+      const summary = `Project ${project.id} indexed on branch "${branch}": ${symbolsFound} symbols across ${totalFiles} files. Repository: ${project.git_repo_url}`
 
+      // Branch-scoped memory: user_id = "project-{id}:branch-{name}"
+      // This enables branch-level isolation when searching
+      const branchUserId = `project-${projectId}:branch-${branch}`
+      const baseUserId = `project-${projectId}`
+
+      // Store branch-specific memory
       await fetch(`${mem0Url}/v1/memories/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: [{ role: 'user', content: summary }],
-          user_id: `project-${projectId}`,
-          metadata: { type: 'index', branch, symbols: symbolsFound, files: totalFiles }
+          user_id: branchUserId,
+          metadata: {
+            type: 'index',
+            project_id: projectId,
+            branch,
+            symbols: symbolsFound,
+            files: totalFiles,
+            indexed_at: new Date().toISOString(),
+          }
         }),
         signal: AbortSignal.timeout(15000),
       })
-      appendLog(jobId, `mem0 ingest OK`)
+
+      // Also store a base project-level memory (for fallback queries without branch)
+      await fetch(`${mem0Url}/v1/memories/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: `[branch:${branch}] ${summary}` }],
+          user_id: baseUserId,
+          metadata: {
+            type: 'index',
+            project_id: projectId,
+            branch,
+            symbols: symbolsFound,
+            files: totalFiles,
+            indexed_at: new Date().toISOString(),
+          }
+        }),
+        signal: AbortSignal.timeout(15000),
+      })
+
+      appendLog(jobId, `mem0 ingest OK (branch-scoped: ${branchUserId})`)
     } catch (err) {
       // mem0 failure is non-fatal — log but continue
       appendLog(jobId, `[warn] mem0 ingest failed: ${err}`)
