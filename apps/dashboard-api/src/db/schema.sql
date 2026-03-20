@@ -70,6 +70,22 @@ CREATE TABLE IF NOT EXISTS projects (
     UNIQUE(org_id, slug)
 );
 
+-- ── Index Jobs ──
+CREATE TABLE IF NOT EXISTS index_jobs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    branch TEXT DEFAULT 'main',
+    status TEXT DEFAULT 'pending',       -- pending | cloning | analyzing | ingesting | done | error
+    progress INTEGER DEFAULT 0,          -- 0-100
+    total_files INTEGER DEFAULT 0,
+    symbols_found INTEGER DEFAULT 0,
+    log TEXT,                             -- stdout/stderr from gitnexus
+    error TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 -- ── Usage Logs ──
 CREATE TABLE IF NOT EXISTS usage_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

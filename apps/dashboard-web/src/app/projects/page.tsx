@@ -1,10 +1,14 @@
 'use client'
 
-import { useState, useCallback, Suspense } from 'react'
+import { useState, useCallback, useEffect, useRef, Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
-import { getProject, updateProject } from '@/lib/api'
+import {
+  getProject, updateProject,
+  startIndexing, getIndexStatus, getIndexHistory, cancelIndexing,
+  type IndexStatus, type IndexJobSummary
+} from '@/lib/api'
 import styles from './page.module.css'
 
 const GIT_PROVIDERS = [
@@ -14,6 +18,200 @@ const GIT_PROVIDERS = [
   { value: 'azure', label: 'Azure', icon: '☁️' },
   { value: 'local', label: 'Local', icon: '💻' },
 ]
+
+const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string }> = {
+  pending:   { label: 'Pending',   color: '#888', icon: '⏳' },
+  cloning:   { label: 'Cloning',   color: '#f5a623', icon: '📥' },
+  analyzing: { label: 'Analyzing', color: '#4a90d9', icon: '🔍' },
+  ingesting: { label: 'Ingesting', color: '#9b59b6', icon: '🧠' },
+  done:      { label: 'Done',      color: '#27ae60', icon: '✅' },
+  error:     { label: 'Error',     color: '#e74c3c', icon: '❌' },
+  none:      { label: 'Not indexed', color: '#666', icon: '—' },
+}
+
+function IndexingPanel({ projectId, hasGitUrl }: { projectId: string; hasGitUrl: boolean }) {
+  const [branch, setBranch] = useState('main')
+  const [starting, setStarting] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const [showLog, setShowLog] = useState(false)
+
+  const { data: status, mutate: mutateStatus } = useSWR<IndexStatus>(
+    `index-status-${projectId}`,
+    () => getIndexStatus(projectId),
+    { refreshInterval: 5000 }
+  )
+
+  const { data: historyData, mutate: mutateHistory } = useSWR(
+    `index-history-${projectId}`,
+    () => getIndexHistory(projectId),
+    { refreshInterval: 15000 }
+  )
+
+  const isActive = status && ['pending', 'cloning', 'analyzing', 'ingesting'].includes(status.status)
+
+  // Poll faster when active
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  useEffect(() => {
+    if (isActive) {
+      pollRef.current = setInterval(() => { mutateStatus() }, 2000)
+    }
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [isActive, mutateStatus])
+
+  const handleStart = useCallback(async () => {
+    setStarting(true)
+    try {
+      await startIndexing(projectId, branch)
+      mutateStatus()
+      mutateHistory()
+    } catch {
+      // handled
+    } finally {
+      setStarting(false)
+    }
+  }, [projectId, branch, mutateStatus, mutateHistory])
+
+  const handleCancel = useCallback(async () => {
+    setCancelling(true)
+    try {
+      await cancelIndexing(projectId)
+      mutateStatus()
+      mutateHistory()
+    } catch {
+      // handled
+    } finally {
+      setCancelling(false)
+    }
+  }, [projectId, mutateStatus, mutateHistory])
+
+  const statusInfo = STATUS_CONFIG[status?.status ?? 'none'] ?? { label: 'Unknown', color: '#666', icon: '—' }
+
+  const history = historyData?.jobs ?? []
+
+  return (
+    <div className={`card ${styles.indexingCard}`}>
+      <div className={styles.indexingHeader}>
+        <h3 className={styles.infoTitle}>
+          🚀 Code Indexing
+        </h3>
+        <span className={styles.statusBadge} style={{ background: statusInfo.color }}>
+          {statusInfo.icon} {statusInfo.label}
+        </span>
+      </div>
+
+      {/* Current Status */}
+      {status && status.status !== 'none' && (
+        <div className={styles.indexingStatus}>
+          <div className={styles.progressContainer}>
+            <div className={styles.progressBar}>
+              <div
+                className={`${styles.progressFill} ${isActive ? styles.progressAnimated : ''}`}
+                style={{ width: `${status.progress ?? 0}%` }}
+              />
+            </div>
+            <span className={styles.progressText}>{status.progress ?? 0}%</span>
+          </div>
+          <div className={styles.indexingMeta}>
+            {status.branch && <span>📌 Branch: <strong>{status.branch}</strong></span>}
+            {(status.symbolsFound ?? 0) > 0 && <span>🧩 {status.symbolsFound} symbols</span>}
+            {(status.totalFiles ?? 0) > 0 && <span>📄 {status.totalFiles} files</span>}
+          </div>
+          {status.error && (
+            <div className={styles.indexingError}>
+              ⚠️ {status.error}
+            </div>
+          )}
+          {status.log && (
+            <div className={styles.logSection}>
+              <button
+                className={styles.logToggle}
+                onClick={() => setShowLog(!showLog)}
+              >
+                {showLog ? '▼ Hide Log' : '▶ Show Log'}
+              </button>
+              {showLog && (
+                <pre className={styles.logOutput}>{status.log}</pre>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Actions */}
+      {hasGitUrl && (
+        <div className={styles.indexingActions}>
+          <div className={styles.branchInput}>
+            <label className={styles.branchLabel}>Branch:</label>
+            <input
+              className={styles.branchField}
+              type="text"
+              value={branch}
+              onChange={(e) => setBranch(e.target.value)}
+              placeholder="main"
+              disabled={isActive}
+            />
+          </div>
+          {isActive ? (
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={handleCancel}
+              disabled={cancelling}
+              style={{ borderColor: 'var(--danger)', color: 'var(--danger)' }}
+            >
+              {cancelling ? 'Cancelling...' : '⏹ Cancel'}
+            </button>
+          ) : (
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={handleStart}
+              disabled={starting || !branch.trim()}
+            >
+              {starting ? 'Starting...' : '🚀 Start Indexing'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {!hasGitUrl && (
+        <div className={styles.indexingEmpty}>
+          Connect a Git repository first to enable code indexing.
+        </div>
+      )}
+
+      {/* History */}
+      {history.length > 0 && (
+        <div className={styles.indexingHistory}>
+          <h4 className={styles.historyTitle}>Index History</h4>
+          <div className={styles.historyTable}>
+            <div className={styles.historyHeaderRow}>
+              <span>Branch</span>
+              <span>Status</span>
+              <span>Symbols</span>
+              <span>Files</span>
+              <span>Date</span>
+            </div>
+            {history.slice(0, 5).map((job: IndexJobSummary) => {
+              const jobStatus = STATUS_CONFIG[job.status] ?? { label: 'Unknown', color: '#666', icon: '—' }
+              return (
+                <div key={job.id} className={styles.historyRow}>
+                  <span className={styles.historyBranch}>{job.branch}</span>
+                  <span className={styles.historyStatus} style={{ color: jobStatus.color }}>
+                    {jobStatus.icon} {jobStatus.label}
+                  </span>
+                  <span>{job.symbols_found}</span>
+                  <span>{job.total_files}</span>
+                  <span className={styles.historyDate}>
+                    {new Date(job.created_at).toLocaleDateString()}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 function ProjectContent() {
   const searchParams = useSearchParams()
@@ -44,7 +242,7 @@ function ProjectContent() {
     } finally {
       setSaving(false)
     }
-  }, [projectId, gitUrl, gitProvider, mutate])
+  }, [projectId, gitUrl, gitProvider, gitUsername, gitToken, mutate])
 
   if (!projectId) {
     return (
@@ -198,6 +396,9 @@ function ProjectContent() {
           )}
         </div>
       </div>
+
+      {/* Indexing Panel */}
+      <IndexingPanel projectId={projectId} hasGitUrl={!!project.git_repo_url} />
 
       {/* Activity placeholder */}
       <div className={`card ${styles.activityCard}`}>
