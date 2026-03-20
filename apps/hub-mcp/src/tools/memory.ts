@@ -5,29 +5,49 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 /**
  * Register memory tools.
  * Proxies to mem0 API for agent memory storage and retrieval.
+ * Supports branch-scoped knowledge via user_id namespacing:
+ *   - project-{id}:branch-{name} → branch-specific memories
+ *   - project-{id} → project-level memories (fallback)
+ *   - {agentId} → agent-level memories (default)
  */
 export function registerMemoryTools(server: McpServer, env: Env) {
   // memory.store — persist a memory for an agent
   server.tool(
     'cortex.memory.store',
-    'Store a memory for an AI agent. Memories persist across sessions and can be recalled by semantic search.',
+    'Store a memory for an AI agent. Memories persist across sessions and can be recalled by semantic search. Use projectId + branch to scope memories to a specific branch.',
     {
       content: z.string().describe('The memory content to store'),
       agentId: z.string().optional().describe('Agent identifier (default: "default")'),
+      projectId: z.string().optional().describe('Project ID to scope this memory to'),
+      branch: z.string().optional().describe('Git branch to scope this memory to (requires projectId)'),
       metadata: z
         .record(z.string(), z.unknown())
         .optional()
         .describe('Optional metadata tags'),
     },
-    async ({ content, agentId, metadata }) => {
+    async ({ content, agentId, projectId, branch, metadata }) => {
       try {
+        // Build scoped user_id for branch isolation
+        let userId = agentId ?? 'default'
+        if (projectId && branch) {
+          userId = `project-${projectId}:branch-${branch}`
+        } else if (projectId) {
+          userId = `project-${projectId}`
+        }
+
+        const meta = {
+          ...(metadata ?? {}),
+          ...(projectId ? { project_id: projectId } : {}),
+          ...(branch ? { branch } : {}),
+        }
+
         const response = await fetch(`${env.MEM0_URL}/v1/memories/`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             messages: [{ role: 'user', content }],
-            user_id: agentId ?? 'default',
-            metadata: metadata ?? {},
+            user_id: userId,
+            metadata: meta,
           }),
           signal: AbortSignal.timeout(10000),
         })
@@ -51,7 +71,7 @@ export function registerMemoryTools(server: McpServer, env: Env) {
             {
               type: 'text' as const,
               text: JSON.stringify(
-                { stored: true, agentId: agentId ?? 'default', result },
+                { stored: true, userId, projectId, branch, result },
                 null,
                 2
               ),
@@ -72,49 +92,64 @@ export function registerMemoryTools(server: McpServer, env: Env) {
     }
   )
 
-  // memory.search — recall memories by semantic similarity
+  // memory.search — recall memories by semantic similarity (branch-aware)
   server.tool(
     'cortex.memory.search',
-    'Search agent memories by semantic similarity. Returns relevant past memories ranked by relevance.',
+    'Search agent memories by semantic similarity. Use projectId + branch to search branch-specific knowledge with fallback to project-level and then agent-level memories.',
     {
       query: z.string().describe('Search query for memory recall'),
       agentId: z.string().optional().describe('Filter by agent (default: all agents)'),
+      projectId: z.string().optional().describe('Project ID to search within'),
+      branch: z.string().optional().describe('Git branch to search (with fallback to project-level)'),
       limit: z.number().optional().describe('Max results (default: 5)'),
     },
-    async ({ query, agentId, limit }) => {
+    async ({ query, agentId, projectId, branch, limit }) => {
       try {
-        const params = new URLSearchParams({ query })
-        if (agentId) params.set('user_id', agentId)
-        if (limit) params.set('limit', String(limit))
+        const maxResults = limit ?? 5
+        const allMemories: unknown[] = []
 
-        const response = await fetch(
-          `${env.MEM0_URL}/v1/memories/search/?${params.toString()}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              query,
-              user_id: agentId ?? 'default',
-              limit: limit ?? 5,
-            }),
-            signal: AbortSignal.timeout(10000),
-          }
-        )
+        // Branch hierarchy search: branch → project → agent (fallback chain)
+        const searchScopes: string[] = []
+        if (projectId && branch) {
+          searchScopes.push(`project-${projectId}:branch-${branch}`)
+          searchScopes.push(`project-${projectId}`) // fallback
+        } else if (projectId) {
+          searchScopes.push(`project-${projectId}`)
+        } else {
+          searchScopes.push(agentId ?? 'default')
+        }
 
-        if (!response.ok) {
-          const errorText = await response.text()
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `Memory search failed: ${response.status} ${errorText}`,
-              },
-            ],
-            isError: true,
+        for (const userId of searchScopes) {
+          if (allMemories.length >= maxResults) break
+
+          const remaining = maxResults - allMemories.length
+          const response = await fetch(
+            `${env.MEM0_URL}/v1/memories/search/`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query,
+                user_id: userId,
+                limit: remaining,
+              }),
+              signal: AbortSignal.timeout(10000),
+            }
+          )
+
+          if (response.ok) {
+            const memories = await response.json()
+            if (Array.isArray(memories)) {
+              allMemories.push(
+                ...memories.map((m: Record<string, unknown>) => ({
+                  ...m,
+                  _scope: userId,
+                }))
+              )
+            }
           }
         }
 
-        const memories = await response.json()
         return {
           content: [
             {
@@ -122,9 +157,9 @@ export function registerMemoryTools(server: McpServer, env: Env) {
               text: JSON.stringify(
                 {
                   query,
-                  agentId: agentId ?? 'all',
-                  count: Array.isArray(memories) ? memories.length : 0,
-                  memories,
+                  scopes: searchScopes,
+                  count: allMemories.length,
+                  memories: allMemories,
                 },
                 null,
                 2
