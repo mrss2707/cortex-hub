@@ -342,3 +342,54 @@ export interface ProjectAnalytics {
 export async function getProjectAnalytics(projectId: string) {
   return apiFetch<ProjectAnalytics>(`/api/metrics/projects/${projectId}/analytics`)
 }
+
+// ── Indexing ──
+export interface IndexStatus {
+  jobId?: string
+  branch?: string
+  status: string
+  progress?: number
+  totalFiles?: number
+  symbolsFound?: number
+  error?: string | null
+  log?: string | null
+  startedAt?: string | null
+  completedAt?: string | null
+  createdAt?: string
+  message?: string
+}
+
+export interface IndexJobSummary {
+  id: string
+  branch: string
+  status: string
+  progress: number
+  total_files: number
+  symbols_found: number
+  error: string | null
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+}
+
+export async function startIndexing(projectId: string, branch?: string) {
+  return apiFetch<{ jobId: string; status: string; branch: string }>(
+    `/api/projects/${projectId}/index`,
+    { method: 'POST', body: { branch: branch ?? 'main' } }
+  )
+}
+
+export async function getIndexStatus(projectId: string) {
+  return apiFetch<IndexStatus>(`/api/projects/${projectId}/index/status`)
+}
+
+export async function getIndexHistory(projectId: string) {
+  return apiFetch<{ jobs: IndexJobSummary[] }>(`/api/projects/${projectId}/index/history`)
+}
+
+export async function cancelIndexing(projectId: string) {
+  return apiFetch<{ success: boolean; jobId: string }>(
+    `/api/projects/${projectId}/index/cancel`,
+    { method: 'POST' }
+  )
+}

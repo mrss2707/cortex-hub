@@ -9,8 +9,9 @@ import { llmRouter } from './routes/llm.js'
 import { intelRouter } from './routes/intel.js'
 import { qualityRouter, sessionsRouter } from './routes/quality.js'
 import { orgsRouter, projectsRouter } from './routes/organizations.js'
+import { indexingRouter } from './routes/indexing.js'
 import { usageRouter } from './routes/usage.js'
-import { statsRouter } from './routes/stats.js'
+import { statsRouter as metricsRouter } from './routes/stats.js'
 
 const app = new Hono()
 const logger = createLogger('dashboard-api')
@@ -67,8 +68,9 @@ app.route('/api/quality', qualityRouter)
 app.route('/api/sessions', sessionsRouter)
 app.route('/api/orgs', orgsRouter)
 app.route('/api/projects', projectsRouter)
+app.route('/api/projects', indexingRouter)
 app.route('/api/usage', usageRouter)
-app.route('/api/stats', statsRouter)
+app.route('/api/metrics', metricsRouter)
 
 const port = Number(process.env['PORT'] ?? 4000)
 

@@ -308,8 +308,255 @@
 
 .providerBtn span:first-child { font-size: 1.25rem; }
 
+/* ── Indexing Panel ── */
+.indexingCard {
+  padding: var(--space-5);
+  margin-bottom: var(--space-6);
+}
+
+.indexingHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-4);
+}
+
+.indexingHeader .infoTitle { margin-bottom: 0; }
+
+.statusBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: 0.02em;
+}
+
+.indexingStatus {
+  margin-bottom: var(--space-4);
+}
+
+.progressContainer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.progressBar {
+  flex: 1;
+  height: 8px;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+}
+
+.progressFill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--primary), var(--accent-secondary));
+  border-radius: 4px;
+  transition: width 0.5s ease;
+  min-width: 0;
+}
+
+.progressAnimated {
+  background: linear-gradient(
+    90deg,
+    var(--primary) 0%,
+    var(--accent-secondary) 50%,
+    var(--primary) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite linear;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.progressText {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  min-width: 36px;
+  text-align: right;
+}
+
+.indexingMeta {
+  display: flex;
+  gap: var(--space-4);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.indexingMeta strong {
+  color: var(--text-primary);
+}
+
+.indexingError {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  background: rgba(231, 76, 60, 0.1);
+  border: 1px solid rgba(231, 76, 60, 0.2);
+  border-radius: var(--radius-md);
+  color: var(--status-error);
+  font-size: 0.8125rem;
+}
+
+.logSection {
+  margin-top: var(--space-3);
+}
+
+.logToggle {
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 0.75rem;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.logToggle:hover {
+  color: var(--text-secondary);
+}
+
+.logOutput {
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.indexingActions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.branchInput {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.branchLabel {
+  font-size: 0.8125rem;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+.branchField {
+  padding: 6px 10px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  font-family: var(--font-mono);
+  width: 140px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.branchField:focus {
+  border-color: var(--primary);
+}
+
+.branchField:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.indexingEmpty {
+  text-align: center;
+  padding: var(--space-4);
+  color: var(--text-tertiary);
+  font-size: 0.8125rem;
+}
+
+/* Index History */
+.indexingHistory {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.historyTitle {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 var(--space-3) 0;
+}
+
+.historyTable {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.historyHeaderRow {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr 0.7fr 0.7fr 1fr;
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--bg-primary);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+}
+
+.historyRow {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr 0.7fr 0.7fr 1fr;
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+  align-items: center;
+}
+
+.historyRow:last-child { border-bottom: none; }
+
+.historyBranch {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--accent-primary);
+}
+
+.historyStatus {
+  font-weight: 500;
+  font-size: 0.75rem;
+}
+
+.historyDate {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+}
+
 @media (max-width: 1024px) {
   .statsGrid { grid-template-columns: repeat(2, 1fr); }
   .infoGrid { grid-template-columns: 1fr; }
   .providerGrid { grid-template-columns: repeat(2, 1fr); }
+  .historyHeaderRow,
+  .historyRow { grid-template-columns: 1fr 1fr 0.7fr 0.7fr 1fr; }
 }
