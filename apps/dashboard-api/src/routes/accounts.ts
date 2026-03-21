@@ -34,44 +34,52 @@ const MANAGEMENT_KEY = () =>
 let seeded = false
 function seedExistingProviders() {
   if (seeded) return
-  seeded = true
 
-  const count = (db.prepare('SELECT COUNT(*) as c FROM provider_accounts').get() as { c: number }).c
-  if (count > 0) return // already have providers
+  try {
+    const count = (db.prepare('SELECT COUNT(*) as c FROM provider_accounts').get() as { c: number }).c
+    if (count > 0) {
+      seeded = true
+      return // already have providers
+    }
 
-  // Seed CLIProxy (OpenAI via OAuth)
-  db.prepare(
-    `INSERT OR IGNORE INTO provider_accounts (id, name, type, auth_type, api_base, status, capabilities)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    'pa-cliproxy-openai',
-    'CLIProxy (OpenAI OAuth)',
-    'openai_compat',
-    'oauth',
-    `${CLIPROXY_URL()}/v1`,
-    'enabled',
-    '["chat","embedding","code"]'
-  )
-
-  // Seed Gemini (if API key exists in env)
-  const geminiKey = process.env.GEMINI_API_KEY
-  if (geminiKey) {
+    // Seed CLIProxy (OpenAI via OAuth)
     db.prepare(
-      `INSERT OR IGNORE INTO provider_accounts (id, name, type, auth_type, api_base, api_key, status, capabilities)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT OR IGNORE INTO provider_accounts (id, name, type, auth_type, api_base, status, capabilities)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(
-      'pa-gemini-gcp',
-      'Google Gemini (GCP)',
-      'gemini',
-      'api_key',
-      'https://generativelanguage.googleapis.com/v1beta',
-      geminiKey,
+      'pa-cliproxy-openai',
+      'CLIProxy (OpenAI OAuth)',
+      'openai_compat',
+      'oauth',
+      `${CLIPROXY_URL()}/v1`,
       'enabled',
-      '["chat","embedding"]'
+      '["chat","embedding","code"]'
     )
-  }
 
-  console.log('[accounts] Auto-seeded existing providers from environment')
+    // Seed Gemini (if API key exists in env)
+    const geminiKey = process.env.GEMINI_API_KEY
+    if (geminiKey) {
+      db.prepare(
+        `INSERT OR IGNORE INTO provider_accounts (id, name, type, auth_type, api_base, api_key, status, capabilities)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        'pa-gemini-gcp',
+        'Google Gemini (GCP)',
+        'gemini',
+        'api_key',
+        'https://generativelanguage.googleapis.com/v1beta',
+        geminiKey,
+        'enabled',
+        '["chat","embedding"]'
+      )
+    }
+
+    seeded = true
+    console.log('[accounts] Auto-seeded existing providers from environment')
+  } catch (err) {
+    // Table might not exist yet — will retry on next request
+    console.warn('[accounts] Seed failed (will retry):', String(err).slice(0, 100))
+  }
 }
 
 // ── List all provider accounts ──
