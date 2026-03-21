@@ -57,12 +57,7 @@ app.get('/health', async (c) => {
   })
 })
 
-app.get('/', (c) => {
-  return c.json({
-    name: 'Cortex Hub Dashboard API',
-    version: '0.1.0',
-  })
-})
+
 
 app.route('/api/setup', setupRouter)
 app.route('/api/keys', keysRouter)
