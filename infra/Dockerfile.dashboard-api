@@ -63,6 +63,12 @@ COPY --from=builder /app/apps/hub-mcp/dist ./apps/hub-mcp/dist
 COPY --from=builder /app/packages/shared-utils/dist ./packages/shared-utils/dist
 COPY --from=builder /app/packages/shared-types/dist ./packages/shared-types/dist
 
+# Create workspace symlinks in node_modules for ESM resolution
+RUN mkdir -p /app/node_modules/@cortex && \
+    ln -sf /app/packages/shared-utils /app/node_modules/@cortex/shared-utils && \
+    ln -sf /app/packages/shared-types /app/node_modules/@cortex/shared-types && \
+    ln -sf /app/apps/hub-mcp /app/node_modules/@cortex/hub-mcp
+
 # Copy runtime assets
 RUN mkdir -p /app/apps/dashboard-api/dist/db
 COPY --from=builder /app/apps/dashboard-api/src/db/schema.sql ./apps/dashboard-api/dist/db/schema.sql
