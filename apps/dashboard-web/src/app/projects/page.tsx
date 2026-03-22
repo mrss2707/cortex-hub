@@ -131,7 +131,6 @@ function IndexingPanel({ projectId, hasGitUrl }: { projectId: string; hasGitUrl:
   const history = historyData?.jobs ?? []
   const branches = branchesData?.branches ?? []
   const indexedBranches = branchIndexData?.branches ?? []
-  const { mutate: mutateBranchIndex } = { mutate: () => {} }
 
   const handleRunMem9 = useCallback(async (targetBranch: string) => {
     setEmbeddingBranch(targetBranch)
