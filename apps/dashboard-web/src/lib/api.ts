@@ -322,6 +322,45 @@ export async function setBudget(data: { dailyLimit: number; monthlyLimit: number
   return apiFetch<{ success: boolean }>('/api/metrics/budget', { method: 'POST', body: data })
 }
 
+// ── Usage (LLM Gateway) ──
+export interface UsageSummary {
+  totalRequests: number
+  totalTokens: number
+  promptTokens: number
+  completionTokens: number
+  todayRequests: number
+  todayTokens: number
+  estimatedCost: number
+}
+
+export interface UsageByModel {
+  models: Array<{ model: string; requests: number; total_tokens: number; prompt_tokens: number; completion_tokens: number }>
+}
+
+export interface UsageByAgent {
+  agents: Array<{ agent_id: string; requests: number; total_tokens: number; last_active: string }>
+}
+
+export interface UsageHistory {
+  history: Array<{ day: string; requests: number; tokens: number }>
+}
+
+export async function getUsageSummary() {
+  return apiFetch<UsageSummary>('/api/usage/summary')
+}
+
+export async function getUsageByModel() {
+  return apiFetch<UsageByModel>('/api/usage/by-model')
+}
+
+export async function getUsageByAgent() {
+  return apiFetch<UsageByAgent>('/api/usage/by-agent')
+}
+
+export async function getUsageHistory(days = 7) {
+  return apiFetch<UsageHistory>(`/api/usage/history?days=${days}`)
+}
+
 // ── Admin ──
 export async function restartService(service: string) {
   return apiFetch<{ success: boolean; message: string }>(`/api/metrics/admin/restart/${service}`, { method: 'POST' })

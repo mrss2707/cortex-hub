@@ -295,11 +295,11 @@ if command -v gitnexus >/dev/null 2>&1; then
     gitnexus audit --local || true
 fi
 
-# Announce session start
-curl -s -X POST "$MCP_URL/session/start" \
+# Announce session start (optional — endpoint may not exist yet)
+curl -s -o /dev/null -X POST "$MCP_URL/session/start" \
      -H "Authorization: Bearer $HUB_API_KEY" \
      -H "Content-Type: application/json" \
-     -d "{\"repo\": \"$GIT_REPO\", \"mode\": \"onboarding\"}" || true
+     -d "{\"repo\": \"$GIT_REPO\", \"mode\": \"onboarding\"}" 2>/dev/null || true
 
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
