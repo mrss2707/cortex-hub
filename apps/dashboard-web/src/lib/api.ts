@@ -427,6 +427,8 @@ export interface BranchIndexStatus {
   progress: number
   total_files: number
   symbols_found: number
+  mem9_status: string | null
+  mem9_chunks: number
   completed_at: string | null
   created_at: string
 }
@@ -447,9 +449,12 @@ export async function getMemNineStatus(projectId: string) {
   return apiFetch<Mem9PipelineStatus>(`/api/projects/${projectId}/index/mem9/status`)
 }
 
-export async function startMemNineEmbedding(projectId: string) {
+export async function startMemNineEmbedding(projectId: string, branch?: string) {
+  const url = branch
+    ? `/api/projects/${projectId}/index/mem9?branch=${encodeURIComponent(branch)}`
+    : `/api/projects/${projectId}/index/mem9`
   return apiFetch<{ success: boolean; jobId: string; branch: string; status: string }>(
-    `/api/projects/${projectId}/index/mem9`,
+    url,
     { method: 'POST' }
   )
 }

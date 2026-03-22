@@ -301,7 +301,8 @@ indexingRouter.get('/:id/index/branches', (c) => {
   try {
     // Get the latest job per branch
     const jobs = db.prepare(
-      `SELECT branch, status, progress, total_files, symbols_found, completed_at, created_at
+      `SELECT branch, status, progress, total_files, symbols_found, 
+              mem9_status, mem9_chunks, completed_at, created_at
        FROM index_jobs
        WHERE project_id = ?
          AND id IN (
@@ -319,17 +320,25 @@ indexingRouter.get('/:id/index/branches', (c) => {
   }
 })
 
-// ── Trigger Mem9 Embedding (standalone) ──
+// ── Trigger Mem9 Embedding (standalone, per-branch) ──
 indexingRouter.post('/:id/index/mem9', async (c) => {
   const projectId = c.req.param('id')
+  const targetBranch = c.req.query('branch')
 
   try {
-    // Find the latest completed index job for this project
-    const latestJob = db.prepare(
-      `SELECT id, branch, status, mem9_status FROM index_jobs 
-       WHERE project_id = ? AND status = 'done' 
-       ORDER BY completed_at DESC LIMIT 1`
-    ).get(projectId) as { id: string; branch: string; status: string; mem9_status: string } | undefined
+    // Find the target job: specific branch or latest completed
+    const query = targetBranch
+      ? `SELECT id, branch, status, mem9_status FROM index_jobs 
+         WHERE project_id = ? AND branch = ? AND status = 'done' 
+         ORDER BY completed_at DESC LIMIT 1`
+      : `SELECT id, branch, status, mem9_status FROM index_jobs 
+         WHERE project_id = ? AND status = 'done' 
+         ORDER BY completed_at DESC LIMIT 1`
+
+    const params = targetBranch ? [projectId, targetBranch] : [projectId]
+    const latestJob = db.prepare(query).get(...params) as {
+      id: string; branch: string; status: string; mem9_status: string
+    } | undefined
 
     if (!latestJob) {
       return c.json({ error: 'No completed indexing job found. Run GitNexus indexing first.' }, 400)
@@ -337,7 +346,7 @@ indexingRouter.post('/:id/index/mem9', async (c) => {
 
     // Check if mem9 is already running
     if (latestJob.mem9_status === 'embedding') {
-      return c.json({ error: 'Mem9 embedding is already running for this project.' }, 409)
+      return c.json({ error: 'Mem9 embedding is already running for this branch.' }, 409)
     }
 
     const jobId = latestJob.id
@@ -347,7 +356,7 @@ indexingRouter.post('/:id/index/mem9', async (c) => {
     db.prepare("UPDATE index_jobs SET mem9_status = 'embedding', mem9_chunks = 0 WHERE id = ?").run(jobId)
 
     // Fire and forget — run embedding in background
-    embedProject(projectId, branch, jobId, (progress, chunks) => {
+    embedProject(projectId, branch, jobId, (_progress, chunks) => {
       db.prepare('UPDATE index_jobs SET mem9_chunks = ? WHERE id = ?').run(chunks, jobId)
     }).then((result) => {
       db.prepare('UPDATE index_jobs SET mem9_status = ?, mem9_chunks = ? WHERE id = ?')

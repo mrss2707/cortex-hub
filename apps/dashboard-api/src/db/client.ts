@@ -53,6 +53,11 @@ try {
   db.exec('ALTER TABLE index_jobs ADD COLUMN mem9_chunks INTEGER DEFAULT 0')
 } catch (e) { /* ignore if exists */ }
 
+// Reset stale mem9 states: 'done' with 0 chunks means embedding never ran
+try {
+  db.exec("UPDATE index_jobs SET mem9_status = 'pending' WHERE mem9_status = 'done' AND (mem9_chunks IS NULL OR mem9_chunks = 0)")
+} catch (e) { /* ignore */ }
+
 if (existsSync(schemaPath)) {
   const schema = readFileSync(schemaPath, 'utf8')
   db.exec(schema)

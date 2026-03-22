@@ -433,7 +433,7 @@ function AddProviderDialog({
       } catch { /* ignore */ }
     }, 3000)
     return () => { clearInterval(interval); setOauthChecking(false) }
-  }, [oauthUrl]) // eslint-disable-line
+  }, [oauthUrl])
 
   const isOAuth = selectedType.authType === 'oauth'
 

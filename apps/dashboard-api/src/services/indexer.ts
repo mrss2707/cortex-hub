@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync, statSync } fr
 import { join, extname } from 'path'
 import { db } from '../db/client.js'
 import { createLogger } from '@cortex/shared-utils'
+import { embedProject } from './mem9-embedder.js'
 
 const logger = createLogger('indexer')
 
@@ -386,6 +387,29 @@ export async function startIndexing(projectId: string, jobId: string, branch: st
     })
 
     logger.info(`[${jobId}] Indexing complete!`)
+
+    // ── Step 5: Auto-trigger mem9 embedding (fire-and-forget) ──
+    try {
+      updateJob(jobId, { mem9_status: 'embedding' })
+      appendLog(jobId, '🧠 Auto-starting mem9 embedding...')
+
+      embedProject(projectId, branch, jobId, (_progress, chunks) => {
+        db.prepare('UPDATE index_jobs SET mem9_chunks = ? WHERE id = ?').run(chunks, jobId)
+      }).then((result) => {
+        updateJob(jobId, { mem9_status: result.status, mem9_chunks: result.chunks })
+        appendLog(jobId, `✅ mem9 done: ${result.chunks} chunks embedded`)
+        if (result.errors.length > 0) {
+          appendLog(jobId, `⚠️ mem9 errors: ${result.errors.slice(0, 3).join('; ')}`)
+        }
+        logger.info(`[${jobId}] mem9 complete: ${result.chunks} chunks`)
+      }).catch((err) => {
+        updateJob(jobId, { mem9_status: 'error' })
+        appendLog(jobId, `❌ mem9 failed: ${err}`)
+        logger.warn(`[${jobId}] mem9 failed (non-fatal): ${err}`)
+      })
+    } catch (err) {
+      logger.warn(`[${jobId}] mem9 auto-trigger failed: ${err}`)
+    }
 
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err)
