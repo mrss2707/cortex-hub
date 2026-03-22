@@ -20,20 +20,26 @@ export class Embedder {
   private readonly chain: ModelSlot[]
   private readonly maxRetries: number
   private readonly baseDelay: number
+  private readonly gatewayUrl?: string
 
   constructor(
     config: EmbedderConfig,
     chain?: ModelSlot[],
-    opts?: { maxRetries?: number; retryDelayMs?: number }
+    opts?: { maxRetries?: number; retryDelayMs?: number; gatewayUrl?: string }
   ) {
     this.config = config
     this.chain = chain ?? []
     this.maxRetries = opts?.maxRetries ?? 2
     this.baseDelay = opts?.retryDelayMs ?? 1000
+    this.gatewayUrl = opts?.gatewayUrl
   }
 
   /** Embed a single text string → float vector */
   async embed(text: string): Promise<number[]> {
+    // Route through gateway if configured
+    if (this.gatewayUrl) {
+      return this.embedViaGateway(text)
+    }
     // If chain is configured, use fallback logic
     if (this.chain.length > 0) {
       return this.embedWithFallback(text)
@@ -43,6 +49,30 @@ export class Embedder {
       return this.embedGemini(text, this.config.apiKey, this.config.model)
     }
     return this.embedOpenAI(text, this.config.apiKey, this.config.model)
+  }
+
+  /** Embed via centralized LLM gateway — it handles routing, fallback, budget, logging */
+  private async embedViaGateway(text: string): Promise<number[]> {
+    const url = `${this.gatewayUrl!.replace(/\/$/, '')}/v1/embeddings`
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: text, model: 'auto' }),
+      signal: AbortSignal.timeout(30000),
+    })
+
+    if (!res.ok) {
+      const err = await res.text().catch(() => '')
+      throw new Error(`Gateway embedding failed (${res.status}): ${err.slice(0, 200)}`)
+    }
+
+    const data = (await res.json()) as {
+      data: Array<{ embedding: number[] }>
+    }
+    const first = data.data[0]
+    if (!first) throw new Error('Gateway returned empty embedding data')
+    return first.embedding
   }
 
   /** Embed multiple texts in batch */
