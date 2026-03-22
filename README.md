@@ -68,18 +68,18 @@ Think of it as **the brain that connects all your AI assistants** — they share
                │   quality.*  session.*            │
                └──────────┬───────────────────────┘
                           │
-            ┌─────────────┼─────────────┐
-            ▼             ▼             ▼
-     ┌────────────┐ ┌──────────┐ ┌──────────┐
-     │  GitNexus  │ │   mem0   │ │  Qdrant  │
-     │  Code      │ │  Memory  │ │  Vectors │
-     │  Graph     │ │  + Neo4j │ │          │
-     └────────────┘ └──────────┘ └──────────┘
-            │
-     ┌──────┴──────┐
-     │  All Repos  │
-     │  Indexed    │
-     └─────────────┘
+            ┌─────────────┼──────────────┐
+            ▼             ▼              ▼
+     ┌────────────┐ ┌──────────┐  ┌──────────────┐
+     │  GitNexus  │ │  Qdrant  │  │  LLM Gateway │
+     │  Code      │ │  Vectors │  │  Proxy       │
+     │  Graph     │ │  (mem9)  │  │  Multi-LLM   │
+     └────────────┘ └──────────┘  └──────────────┘
+            │                            │
+     ┌──────┴──────┐          ┌──────────┴──────────┐
+     │  All Repos  │          │ Gemini │ OpenAI │ …  │
+     │  Indexed    │          │ Budget │ Usage  │    │
+     └─────────────┘          └─────────────────────┘
 ```
 
 > **Full architecture docs:** [`docs/architecture/overview.md`](docs/architecture/overview.md)
@@ -88,20 +88,32 @@ Think of it as **the brain that connects all your AI assistants** — they share
 
 ## Features
 
-### 🧠 Code Intelligence (via GitNexus)
+### 🧠 Code Intelligence (via GitNexus + mem9)
 
 - **Semantic code search** — natural language queries against your entire codebase
 - **360° symbol context** — every caller, callee, import, and process for any symbol
 - **Blast radius analysis** — see exactly what breaks before you change anything
 - **Execution flow tracing** — follow code paths across files and modules
 - **Multi-repo support** — all repositories indexed in a single knowledge graph
+- **mem9 embedding pipeline** — auto-indexes repos into Qdrant with smart chunking
 
-### 💾 Agent Memory (via mem0)
+### 🔀 LLM API Gateway
+
+- **Centralized proxy** — all LLM/embedding calls route through a single gateway
+- **Multi-provider support** — Gemini, OpenAI, Anthropic, or any OpenAI-compatible API
+- **Fallback chains** — ordered provider slots with automatic retry (429/502/503/504)
+- **Format translation** — Gemini ↔ OpenAI format handled transparently
+- **Budget enforcement** — daily/monthly token limits from Dashboard settings
+- **Usage logging** — every call recorded with exact token counts per agent/model
+- **OpenAI-compatible API** — `/v1/embeddings` + `/v1/chat/completions`
+
+> Full docs: [`docs/architecture/llm-gateway.md`](docs/architecture/llm-gateway.md)
+
+### 💾 Agent Memory
 
 - **Cross-session memory** — agents remember past decisions, patterns, and context
 - **Semantic recall** — search memories by meaning, not just keywords
 - **Per-agent isolation** — each agent has private memory with optional shared spaces
-- **Graph relationships** — Neo4j tracks connections between memories
 
 ### 📚 Knowledge Base (via Qdrant)
 
@@ -112,12 +124,10 @@ Think of it as **the brain that connects all your AI assistants** — they share
 
 ### 🛡️ Quality Gates
 
-Inspired by [Forgewright](https://github.com/buiphucminhtam/forgewright-agents)'s quality framework:
-
 - **4-dimension scoring** — Build (25) + Regression (25) + Standards (25) + Traceability (25)
 - **Grade system** — A through F, with configurable thresholds
 - **Trend tracking** — see quality score over time per project
-- **Policy enforcement** — code reuse gate, incremental change guard, test coverage gate
+- **Auto-generated hooks** — Lefthook pre-commit/pre-push from project-profile.json
 
 ### 🔄 Session Handoff
 
@@ -129,9 +139,10 @@ Inspired by [Forgewright](https://github.com/buiphucminhtam/forgewright-agents)'
 ### 📊 Dashboard
 
 - **Real-time monitoring** — service health, query logs, active sessions
-- **Knowledge management** — search, approve, reject contributed items
-- **Quality trends** — line charts showing score progression
-- **Dependency checker** — track third-party service versions and updates
+- **LLM Provider management** — add/test/configure providers with smart model discovery
+- **Usage analytics** — token consumption by model, agent, day/week/month
+- **Budget controls** — set daily/monthly limits with alert thresholds
+- **Project management** — repo indexing, embedding status, knowledge base
 
 ---
 
@@ -139,16 +150,16 @@ Inspired by [Forgewright](https://github.com/buiphucminhtam/forgewright-agents)'
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| **Gateway** | Cloudflare Workers | Hub MCP Server (edge-deployed) |
-| **Code Intel** | GitNexus | AST parsing + knowledge graph |
-| **Memory** | mem0 + Neo4j | Long-term agent memory |
+| **MCP Gateway** | Cloudflare Workers | Hub MCP Server (edge-deployed) |
+| **LLM Gateway** | Hono (dashboard-api) | Multi-provider LLM proxy with fallback |
+| **Code Intel** | GitNexus + mem9 | AST parsing + embedding pipeline |
 | **Vectors** | Qdrant | Semantic search engine |
-| **App DB** | SQLite (WAL) | Quality reports, query logs, sessions |
+| **App DB** | SQLite (WAL) | Usage logs, budgets, providers, sessions |
 | **API** | Hono | Dashboard backend |
-| **Frontend** | Next.js 15 | Dashboard web interface |
+| **Frontend** | Next.js 15 + React 19 | Dashboard web interface |
 | **Infra** | Docker Compose | Service orchestration |
 | **Tunnel** | Cloudflare Tunnel | Secure exposure, zero open ports |
-| **CI/CD** | GitHub Actions | Automated testing and deployment |
+| **CI/CD** | Lefthook + GitHub Actions | Git hooks + automated testing |
 | **Monorepo** | pnpm + Turborepo | Build orchestration |
 
 > **Full stack details:** [`docs/architecture/tech-stack.md`](docs/architecture/tech-stack.md)
@@ -167,8 +178,12 @@ Inspired by [Forgewright](https://github.com/buiphucminhtam/forgewright-agents)'
 ### One-Command Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lktiep/cortex-hub/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lktiep/cortex-hub/master/scripts/bootstrap.sh | bash
 ```
+
+The bootstrap script offers two modes:
+1. **Administrator** — Full Docker stack, infrastructure, and onboarding
+2. **Member** — Connect your local agent to an existing Hub (prompts for MCP URL + API key)
 
 ### Manual Setup
 
@@ -255,14 +270,17 @@ cortex-hub/
 ├── packages/                    # Shared libraries
 │   ├── shared-types/            #   TypeScript type definitions
 │   ├── shared-utils/            #   Common utility functions
+│   ├── shared-mem9/             #   Embedding pipeline + vector store
 │   └── ui-components/           #   Shared React components
 ├── apps/
 │   ├── hub-mcp/                 # Hub MCP Server (Cloudflare Worker)
 │   ├── dashboard-api/           # Dashboard Backend (Hono + SQLite)
+│   │   └── routes/llm.ts        #   ← LLM Gateway (multi-provider proxy)
 │   └── dashboard-web/           # Dashboard Frontend (Next.js 15)
 ├── infra/                       # Docker Compose + scripts
+├── scripts/                     # Bootstrap + onboarding scripts
 ├── docs/                        # Documentation
-└── .github/workflows/           # CI/CD
+└── .cortex/                     # Project profile + code conventions
 ```
 
 > **Full structure breakdown:** [`docs/architecture/monorepo-structure.md`](docs/architecture/monorepo-structure.md)
@@ -274,33 +292,41 @@ cortex-hub/
 | Document | Description |
 |---|---|
 | [`docs/architecture/overview.md`](docs/architecture/overview.md) | System architecture and component diagram |
+| [`docs/architecture/llm-gateway.md`](docs/architecture/llm-gateway.md) | LLM Gateway: fallback chains, budget, usage logging |
 | [`docs/architecture/monorepo-structure.md`](docs/architecture/monorepo-structure.md) | Detailed directory layout and package graph |
 | [`docs/architecture/tech-stack.md`](docs/architecture/tech-stack.md) | Technology choices with versions and licenses |
-| [`docs/guides/implementation.md`](docs/guides/implementation.md) | Step-by-step deployment guide |
-| [`docs/guides/installation.md`](docs/guides/installation.md) | All-in-one installer and packaging |
-| [`docs/api/hub-mcp-reference.md`](docs/api/hub-mcp-reference.md) | Complete MCP tool API reference |
-| [`docs/api/database-schema.md`](docs/api/database-schema.md) | Database schema definitions |
-| [`docs/policies/ai-policies.md`](docs/policies/ai-policies.md) | Quality gates and AI policy enforcement |
-| [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) | Contributing guidelines |
+| [`docs/architecture/agent-quality-strategy.md`](docs/architecture/agent-quality-strategy.md) | Quality gates and scoring dimensions |
+| [`docs/database/erd.md`](docs/database/erd.md) | Database ERD and schema definitions |
+| [`.cortex/code-conventions.md`](.cortex/code-conventions.md) | Code conventions and standards |
 
 ---
 
 ## Roadmap
 
-| Phase | Scope | Timeline |
+| Phase | Scope | Status |
 |---|---|---|
-| **Phase 1: Foundation** | Infrastructure, monorepo, Docker stack | Weeks 1-2 |
-| **Phase 2: Integration** | Hub MCP Server, agent connections | Weeks 3-4 |
-| **Phase 3: Intelligence** | Semantic search, quality trending, auto-contribution | Weeks 5-6 |
-| **Phase 4: Evolution** | Auto-skill generation, multi-branch indexing, agent metrics | Weeks 7+ |
+| **Phase 1** | Server + Cloudflare Tunnel | ✅ Done |
+| **Phase 2** | Monorepo skeleton + shared packages | ✅ Done |
+| **Phase 3** | Docker stack (Qdrant, Neo4j, CLIProxy, Watchtower) | ✅ Done |
+| **Phase 4** | Hub MCP Server (Cloudflare Worker) | ✅ Done |
+| **Phase 5** | Dashboard Frontend (Next.js 15) | ✅ Done |
+| **Phase 6** | Polish, docs, testing, GA release | 🔄 In Progress |
+
+### Recent Milestones
+
+- [x] LLM API Gateway with multi-provider fallback + budget enforcement
+- [x] mem9 embedding pipeline (repo → Qdrant)
+- [x] Smart provider model discovery (no hardcoded lists)
+- [x] Interactive onboarding script (`bootstrap.sh`)
+- [x] Lefthook git hooks auto-generated from project profile
+- [x] Usage analytics dashboard
 
 ### Planned Features
 
-- [ ] AI-powered code review on pull requests
-- [ ] Interactive knowledge graph visualization
+- [ ] Streaming chat completions via gateway
 - [ ] Agent performance leaderboard
+- [ ] Interactive knowledge graph visualization
 - [ ] Slack/Discord alert integrations
-- [ ] Mobile-responsive PWA dashboard
 - [ ] Plugin marketplace for community skills
 
 ---
@@ -313,10 +339,9 @@ Cortex is designed to run almost entirely on free tiers:
 |---|---|
 | Self-hosted server | Your existing infrastructure |
 | Cloudflare Workers | Free (100K req/day) |
-| Cloudflare Pages | Free |
 | Cloudflare Tunnel | Free |
-| OpenAI (embeddings) | ~$0.05/month |
-| **Total** | **≈ $0.05/month** |
+| LLM API (via gateway) | Depends on provider — budget-controlled |
+| **Total** | **≈ $0 + LLM usage** |
 
 ---
 
