@@ -51,7 +51,7 @@ app.get('/health', async (c) => {
     checkService('qdrant', `${process.env['QDRANT_URL'] || 'http://qdrant:6333'}/healthz`),
     checkService('cliproxy', `${process.env['LLM_PROXY_URL'] || 'http://llm-proxy:8317'}/v1/models`),
     checkService('gitnexus', `${process.env['GITNEXUS_URL'] || 'http://gitnexus:4848'}/health`),
-    checkService('mem9', `${process.env['MEM9_URL'] || 'http://mem9:3100'}/health`),
+    checkService('mem9', `http://localhost:${process.env.PORT || 4000}/api/mem9/health`),
     checkService('mcp', `${process.env['MCP_HEALTH_URL'] || 'https://cortex-mcp.jackle.dev/health'}`),
   ])
 

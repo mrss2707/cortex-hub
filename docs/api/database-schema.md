@@ -63,24 +63,42 @@ CREATE INDEX idx_knowledge_approved ON knowledge_items(approved);
 
 ### `quality_reports`
 
-Quality gate results for trend tracking.
+4-dimension quality gate results with automated scoring. Each report captures Build (25) + Regression (25) + Standards (25) + Traceability (25) = 100.
 
 ```sql
+-- SQLite (Dashboard API)
 CREATE TABLE quality_reports (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    agent_id    TEXT NOT NULL,
-    project     TEXT NOT NULL,
-    session_id  TEXT,
-    score       INTEGER CHECK (score BETWEEN 0 AND 100),
-    grade       CHAR(1) CHECK (grade IN ('A','B','C','D','F')),
-    breakdown   JSONB,                -- {"build": 25, "regression": 20, "standards": 15, "trace": 10}
-    created_at  TIMESTAMPTZ DEFAULT now()
+    id                  TEXT PRIMARY KEY,
+    project_id          TEXT,
+    agent_id            TEXT NOT NULL,
+    session_id          TEXT,
+    gate_name           TEXT NOT NULL,
+    score_build         INTEGER NOT NULL DEFAULT 0,       -- 0-25
+    score_regression    INTEGER NOT NULL DEFAULT 0,       -- 0-25
+    score_standards     INTEGER NOT NULL DEFAULT 0,       -- 0-25
+    score_traceability  INTEGER NOT NULL DEFAULT 0,       -- 0-25
+    score_total         INTEGER NOT NULL DEFAULT 0,       -- 0-100 (sum of 4 dimensions)
+    grade               TEXT NOT NULL DEFAULT 'F'
+                        CHECK(grade IN ('A','B','C','D','F')),
+    passed              BOOLEAN NOT NULL DEFAULT 0,
+    details             TEXT,                              -- JSON
+    created_at          TEXT DEFAULT (datetime('now'))
 );
 
-CREATE INDEX idx_quality_project ON quality_reports(project);
-CREATE INDEX idx_quality_agent ON quality_reports(agent_id);
-CREATE INDEX idx_quality_created ON quality_reports(created_at);
+CREATE INDEX idx_quality_reports_project_created
+    ON quality_reports(project_id, created_at DESC);
+CREATE INDEX idx_quality_reports_agent
+    ON quality_reports(agent_id, created_at DESC);
 ```
+
+**Grade thresholds:** A >= 90, B >= 80, C >= 70, D >= 60, F < 60 (configurable)
+
+**API endpoints:**
+- `POST /api/quality/report` — Submit report (auto-scores from `results` or accepts legacy `score`)
+- `GET /api/quality/reports` — List with filters (`project_id`, `agent_id`, `grade`)
+- `GET /api/quality/reports/latest` — Most recent report
+- `GET /api/quality/trends?days=30` — Daily aggregated trends
+- `GET /api/quality/summary` — Overall statistics + grade distribution
 
 ### `session_handoffs`
 

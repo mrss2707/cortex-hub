@@ -65,10 +65,15 @@ export type LogQueryFilters = {
   perPage?: number
 }
 
-/** Quality trend data point */
+/** Quality trend data point (daily aggregation) */
 export type QualityTrendPoint = {
   date: string
-  scoreTotal: number
-  grade: string
-  agentName: string
+  avgScore: number
+  avgBuild: number
+  avgRegression: number
+  avgStandards: number
+  avgTraceability: number
+  reportCount: number
+  worstGrade: string
+  bestGrade: string
 }
