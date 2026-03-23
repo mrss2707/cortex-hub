@@ -36,6 +36,7 @@ const CODE_EXTENSIONS = new Set([
 const MAX_FILE_SIZE = 256 * 1024 // 256KB
 const CHUNK_SIZE = 1500 // ~375 tokens (4 chars/token)
 const CHUNK_OVERLAP = 300
+const EMBED_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes global timeout
 
 interface ChunkResult {
   filePath: string
@@ -170,6 +171,23 @@ function buildEmbeddingChain(): { config: EmbedderConfig; chain: ModelSlot[] } {
 // ── Main Embedding Pipeline ──
 
 export async function embedProject(
+  projectId: string,
+  branch: string,
+  jobId: string,
+  onProgress?: (progress: number, chunks: number) => void,
+): Promise<{ status: string; chunks: number; errors: string[] }> {
+  // Wrap with global timeout to prevent infinite hangs
+  const timeoutPromise = new Promise<{ status: string; chunks: number; errors: string[] }>((resolve) => {
+    setTimeout(() => {
+      logger.warn(`[${jobId}] mem9 embedding timed out after ${EMBED_TIMEOUT_MS / 1000}s`)
+      resolve({ status: 'error', chunks: 0, errors: ['Embedding timed out (10 min limit)'] })
+    }, EMBED_TIMEOUT_MS)
+  })
+
+  return Promise.race([embedProjectInternal(projectId, branch, jobId, onProgress), timeoutPromise])
+}
+
+async function embedProjectInternal(
   projectId: string,
   branch: string,
   jobId: string,

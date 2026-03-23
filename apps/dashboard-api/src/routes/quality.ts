@@ -1,24 +1,236 @@
 import { Hono } from 'hono'
 import { db } from '../db/client.js'
+import {
+  calculateFromVerificationResults,
+  scoreToGrade,
+  approximateDimensionsFromTotal,
+  type VerificationResults,
+  type Grade,
+} from '@cortex/shared-types'
 
 export const qualityRouter = new Hono()
 
+// ── POST /report — Submit a quality gate report ──
+// Accepts both legacy format and new 4-dimension format
 qualityRouter.post('/report', async (c) => {
   try {
     const body = await c.req.json()
-    const { gate_name, passed, score, details } = body
-    
-    if (!gate_name) return c.json({ error: 'Gate name is required' }, 400)
+    const {
+      gate_name,
+      agent_id,
+      session_id,
+      project_id,
+      passed,
+      score,
+      details,
+      results, // VerificationResults (new format)
+    } = body
 
-    const stmt = db.prepare('INSERT INTO query_logs (agent_id, tool, params, status) VALUES (?, ?, ?, ?)')
-    stmt.run('agent_test', gate_name, JSON.stringify({ score, details }), passed ? 'ok' : 'error')
+    if (!gate_name) return c.json({ error: 'gate_name is required' }, 400)
 
-    return c.json({ success: true, logged: true })
+    const reportId = `qr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    const agentId = agent_id || 'unknown'
+
+    let scoreBuild = 0
+    let scoreRegression = 0
+    let scoreStandards = 0
+    let scoreTraceability = 0
+    let scoreTotal = 0
+    let grade: Grade = 'F'
+    let reportPassed = false
+
+    if (results) {
+      // New format: auto-calculate from verification results
+      const calculated = calculateFromVerificationResults(results as VerificationResults)
+      scoreBuild = calculated.dimensions.build
+      scoreRegression = calculated.dimensions.regression
+      scoreStandards = calculated.dimensions.standards
+      scoreTraceability = calculated.dimensions.traceability
+      scoreTotal = calculated.total
+      grade = calculated.grade
+      reportPassed = calculated.passed
+    } else if (score !== undefined && score !== null) {
+      // Legacy format: approximate dimensions from single score
+      const dims = approximateDimensionsFromTotal(Number(score))
+      scoreBuild = dims.build
+      scoreRegression = dims.regression
+      scoreStandards = dims.standards
+      scoreTraceability = dims.traceability
+      scoreTotal = Number(score)
+      grade = scoreToGrade(scoreTotal)
+      reportPassed = passed ?? grade !== 'F'
+    } else {
+      // Minimal format: just passed/failed
+      scoreTotal = passed ? 100 : 0
+      grade = passed ? 'A' : 'F'
+      reportPassed = !!passed
+      if (passed) {
+        scoreBuild = 25
+        scoreRegression = 25
+        scoreStandards = 25
+        scoreTraceability = 25
+      }
+    }
+
+    const stmt = db.prepare(`
+      INSERT INTO quality_reports (id, project_id, agent_id, session_id, gate_name,
+        score_build, score_regression, score_standards, score_traceability,
+        score_total, grade, passed, details)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    stmt.run(
+      reportId, project_id || null, agentId, session_id || null, gate_name,
+      scoreBuild, scoreRegression, scoreStandards, scoreTraceability,
+      scoreTotal, grade, reportPassed ? 1 : 0,
+      details ? (typeof details === 'string' ? details : JSON.stringify(details)) : null
+    )
+
+    // Also log to query_logs for backward compatibility
+    const logStmt = db.prepare('INSERT INTO query_logs (agent_id, tool, params, status) VALUES (?, ?, ?, ?)')
+    logStmt.run(agentId, gate_name, JSON.stringify({ score: scoreTotal, grade, details }), reportPassed ? 'ok' : 'error')
+
+    return c.json({
+      success: true,
+      report: {
+        id: reportId,
+        gate_name,
+        score_build: scoreBuild,
+        score_regression: scoreRegression,
+        score_standards: scoreStandards,
+        score_traceability: scoreTraceability,
+        score_total: scoreTotal,
+        grade,
+        passed: reportPassed,
+      },
+    })
   } catch (error) {
     return c.json({ error: String(error) }, 500)
   }
 })
 
+// ── GET /reports — List quality reports with filters ──
+qualityRouter.get('/reports', (c) => {
+  try {
+    const limit = Number(c.req.query('limit') || '50')
+    const projectId = c.req.query('project_id')
+    const agentId = c.req.query('agent_id')
+    const grade = c.req.query('grade')
+
+    let sql = 'SELECT * FROM quality_reports WHERE 1=1'
+    const params: unknown[] = []
+
+    if (projectId) {
+      sql += ' AND project_id = ?'
+      params.push(projectId)
+    }
+    if (agentId) {
+      sql += ' AND agent_id = ?'
+      params.push(agentId)
+    }
+    if (grade) {
+      sql += ' AND grade = ?'
+      params.push(grade)
+    }
+
+    sql += ' ORDER BY created_at DESC LIMIT ?'
+    params.push(limit)
+
+    const reports = db.prepare(sql).all(...params)
+    return c.json({ reports })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ── GET /reports/latest — Most recent report (or per project) ──
+qualityRouter.get('/reports/latest', (c) => {
+  try {
+    const projectId = c.req.query('project_id')
+
+    if (projectId) {
+      const report = db.prepare(
+        'SELECT * FROM quality_reports WHERE project_id = ? ORDER BY created_at DESC LIMIT 1'
+      ).get(projectId)
+      return c.json({ report: report || null })
+    }
+
+    const report = db.prepare(
+      'SELECT * FROM quality_reports ORDER BY created_at DESC LIMIT 1'
+    ).get()
+    return c.json({ report: report || null })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ── GET /trends — Quality score trend over time ──
+qualityRouter.get('/trends', (c) => {
+  try {
+    const days = Number(c.req.query('days') || '30')
+    const projectId = c.req.query('project_id')
+
+    let sql = `
+      SELECT
+        date(created_at) as date,
+        ROUND(AVG(score_total), 1) as avg_score,
+        ROUND(AVG(score_build), 1) as avg_build,
+        ROUND(AVG(score_regression), 1) as avg_regression,
+        ROUND(AVG(score_standards), 1) as avg_standards,
+        ROUND(AVG(score_traceability), 1) as avg_traceability,
+        COUNT(*) as report_count,
+        MIN(grade) as worst_grade,
+        MAX(grade) as best_grade
+      FROM quality_reports
+      WHERE created_at >= datetime('now', '-' || ? || ' days')
+    `
+    const params: unknown[] = [days]
+
+    if (projectId) {
+      sql += ' AND project_id = ?'
+      params.push(projectId)
+    }
+
+    sql += ' GROUP BY date(created_at) ORDER BY date ASC'
+
+    const trends = db.prepare(sql).all(...params)
+    return c.json({ trends, days })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ── GET /summary — Aggregated quality summary ──
+qualityRouter.get('/summary', (c) => {
+  try {
+    const summary = db.prepare(`
+      SELECT
+        COUNT(*) as total_reports,
+        ROUND(AVG(score_total), 1) as avg_score,
+        ROUND(AVG(score_build), 1) as avg_build,
+        ROUND(AVG(score_regression), 1) as avg_regression,
+        ROUND(AVG(score_standards), 1) as avg_standards,
+        ROUND(AVG(score_traceability), 1) as avg_traceability,
+        SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) as passed_count,
+        SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) as failed_count,
+        SUM(CASE WHEN grade = 'A' THEN 1 ELSE 0 END) as grade_a,
+        SUM(CASE WHEN grade = 'B' THEN 1 ELSE 0 END) as grade_b,
+        SUM(CASE WHEN grade = 'C' THEN 1 ELSE 0 END) as grade_c,
+        SUM(CASE WHEN grade = 'D' THEN 1 ELSE 0 END) as grade_d,
+        SUM(CASE WHEN grade = 'F' THEN 1 ELSE 0 END) as grade_f
+      FROM quality_reports
+    `).get()
+
+    const latest = db.prepare(
+      'SELECT * FROM quality_reports ORDER BY created_at DESC LIMIT 1'
+    ).get()
+
+    return c.json({ summary, latest })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ── GET /logs — Backward compatible (reads from query_logs) ──
 qualityRouter.get('/logs', (c) => {
   try {
     const limit = Number(c.req.query('limit') || '50')
@@ -30,13 +242,9 @@ qualityRouter.get('/logs', (c) => {
   }
 })
 
+// ── Sessions Router (unchanged) ──
 export const sessionsRouter = new Hono()
 
-/**
- * POST /start — Create a real session record
- * Body: { repo, mode?, agentId? }
- * Returns: session context with project info, standards, recent quality
- */
 sessionsRouter.post('/start', async (c) => {
   try {
     const body = await c.req.json()
@@ -46,12 +254,10 @@ sessionsRouter.post('/start', async (c) => {
       return c.json({ error: 'agentId is required. Identify your agent (e.g., "claude-code", "antigravity", "cursor").' }, 400)
     }
 
-    // Normalize repo URL: strip .git suffix and trailing slash for consistent matching
     const normalizedRepo = repo
       ? repo.replace(/\.git$/, '').replace(/\/$/, '')
       : 'unknown'
 
-    // Look up project by git_repo_url (handle .git suffix and trailing slash variants)
     let project: Record<string, unknown> | undefined
     if (repo) {
       const stmt = db.prepare(
@@ -66,8 +272,6 @@ sessionsRouter.post('/start', async (c) => {
       ) as Record<string, unknown> | undefined
     }
 
-    // Reuse existing active session for same agent+repo (prevent garbage sessions)
-    // Match normalized URL to handle .git suffix inconsistency
     let sessionId: string
     const existingSession = db.prepare(
       `SELECT id FROM session_handoffs
@@ -83,7 +287,6 @@ sessionsRouter.post('/start', async (c) => {
 
     if (existingSession) {
       sessionId = existingSession.id
-      // Touch the session — update timestamp
       db.prepare(
         `UPDATE session_handoffs SET created_at = datetime('now') WHERE id = ?`
       ).run(sessionId)
@@ -91,20 +294,23 @@ sessionsRouter.post('/start', async (c) => {
       sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
     }
 
-    // Get recent quality logs (last 5)
-    const qualityStmt = db.prepare('SELECT tool, status, created_at FROM query_logs ORDER BY created_at DESC LIMIT 5')
-    const recentQuality = qualityStmt.all()
+    // Recent quality — now reads from quality_reports first, falls back to query_logs
+    let recentQuality = db.prepare(
+      'SELECT gate_name as tool, grade, score_total, passed, created_at FROM quality_reports ORDER BY created_at DESC LIMIT 5'
+    ).all()
+    if (recentQuality.length === 0) {
+      recentQuality = db.prepare(
+        'SELECT tool, status, created_at FROM query_logs ORDER BY created_at DESC LIMIT 5'
+      ).all()
+    }
 
-    // Get recent sessions (last 3) for context continuity
     const recentStmt = db.prepare('SELECT id, task_summary, created_at FROM session_handoffs ORDER BY created_at DESC LIMIT 3')
     const recentSessions = recentStmt.all()
 
-    // Build mission brief from project data or defaults
     const projectName = (project?.name as string) ?? 'Unknown Project'
     const projectDesc = (project?.description as string) ?? ''
     const orgId = (project?.org_id as string) ?? ''
 
-    // Store session record (only if new)
     if (!existingSession) {
       const insertStmt = db.prepare(
         'INSERT INTO session_handoffs (id, from_agent, project, task_summary, context, status) VALUES (?, ?, ?, ?, ?, ?)'
@@ -149,7 +355,7 @@ sessionsRouter.post('/start', async (c) => {
 sessionsRouter.get('/all', (c) => {
   try {
     const limit = Number(c.req.query('limit') || '50')
-    const status = c.req.query('status') // optional filter: active, completed
+    const status = c.req.query('status')
     const stmt = status
       ? db.prepare('SELECT * FROM session_handoffs WHERE status = ? ORDER BY created_at DESC LIMIT ?')
       : db.prepare('SELECT * FROM session_handoffs ORDER BY created_at DESC LIMIT ?')
@@ -160,10 +366,6 @@ sessionsRouter.get('/all', (c) => {
   }
 })
 
-/**
- * PATCH /:id/complete — Close/complete a session
- * Body: { task_summary?, status? }
- */
 sessionsRouter.patch('/:id/complete', async (c) => {
   const { id } = c.req.param()
   try {
@@ -174,7 +376,7 @@ sessionsRouter.patch('/:id/complete', async (c) => {
     if (!existing) return c.json({ error: 'Session not found' }, 404)
 
     db.prepare(
-      `UPDATE session_handoffs 
+      `UPDATE session_handoffs
        SET status = ?, task_summary = COALESCE(?, task_summary)
        WHERE id = ?`
     ).run(status ?? 'completed', task_summary ?? null, id)
@@ -185,9 +387,6 @@ sessionsRouter.patch('/:id/complete', async (c) => {
   }
 })
 
-/**
- * DELETE /:id — Remove a session record
- */
 sessionsRouter.delete('/:id', (c) => {
   const { id } = c.req.param()
   try {
@@ -197,4 +396,3 @@ sessionsRouter.delete('/:id', (c) => {
     return c.json({ error: String(error) }, 500)
   }
 })
-

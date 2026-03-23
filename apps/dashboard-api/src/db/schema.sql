@@ -178,6 +178,30 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
 CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc
 ON knowledge_chunks(document_id);
 
+-- ── Quality Reports (4-dimension scoring) ──
+CREATE TABLE IF NOT EXISTS quality_reports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    agent_id TEXT NOT NULL,
+    session_id TEXT,
+    gate_name TEXT NOT NULL,
+    score_build INTEGER NOT NULL DEFAULT 0,      -- 0-25
+    score_regression INTEGER NOT NULL DEFAULT 0,  -- 0-25
+    score_standards INTEGER NOT NULL DEFAULT 0,   -- 0-25
+    score_traceability INTEGER NOT NULL DEFAULT 0,-- 0-25
+    score_total INTEGER NOT NULL DEFAULT 0,       -- 0-100
+    grade TEXT NOT NULL DEFAULT 'F' CHECK(grade IN ('A','B','C','D','F')),
+    passed BOOLEAN NOT NULL DEFAULT 0,
+    details TEXT,                                  -- JSON
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_reports_project_created
+ON quality_reports(project_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_quality_reports_agent
+ON quality_reports(agent_id, created_at DESC);
+
 -- Insert default uncompleted setup status
 INSERT OR IGNORE INTO setup_status (id, completed) VALUES (1, 0);
 

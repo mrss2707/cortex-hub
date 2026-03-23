@@ -141,7 +141,7 @@ export async function configureProvider(data: { provider: string; apiKey: string
   }>('/api/setup/configure-provider', { method: 'POST', body: data })
 }
 
-// ── Quality Logs ──
+// ── Quality Logs (legacy) ──
 export interface QueryLog {
   id: number
   agent_id: string
@@ -155,6 +155,76 @@ export interface QueryLog {
 
 export async function getQualityLogs(limit = 50) {
   return apiFetch<{ logs: QueryLog[] }>(`/api/quality/logs?limit=${limit}`)
+}
+
+// ── Quality Reports (4-dimension scoring) ──
+export interface QualityReportRow {
+  id: string
+  project_id: string | null
+  agent_id: string
+  session_id: string | null
+  gate_name: string
+  score_build: number
+  score_regression: number
+  score_standards: number
+  score_traceability: number
+  score_total: number
+  grade: string
+  passed: number
+  details: string | null
+  created_at: string
+}
+
+export interface QualityTrendData {
+  date: string
+  avg_score: number
+  avg_build: number
+  avg_regression: number
+  avg_standards: number
+  avg_traceability: number
+  report_count: number
+  worst_grade: string
+  best_grade: string
+}
+
+export interface QualitySummary {
+  total_reports: number
+  avg_score: number | null
+  avg_build: number | null
+  avg_regression: number | null
+  avg_standards: number | null
+  avg_traceability: number | null
+  passed_count: number
+  failed_count: number
+  grade_a: number
+  grade_b: number
+  grade_c: number
+  grade_d: number
+  grade_f: number
+}
+
+export async function getQualityReports(opts?: { limit?: number; projectId?: string; agentId?: string; grade?: string }) {
+  const params = new URLSearchParams()
+  if (opts?.limit) params.set('limit', String(opts.limit))
+  if (opts?.projectId) params.set('project_id', opts.projectId)
+  if (opts?.agentId) params.set('agent_id', opts.agentId)
+  if (opts?.grade) params.set('grade', opts.grade)
+  return apiFetch<{ reports: QualityReportRow[] }>(`/api/quality/reports?${params}`)
+}
+
+export async function getLatestQualityReport(projectId?: string) {
+  const params = projectId ? `?project_id=${projectId}` : ''
+  return apiFetch<{ report: QualityReportRow | null }>(`/api/quality/reports/latest${params}`)
+}
+
+export async function getQualityTrends(days = 30, projectId?: string) {
+  const params = new URLSearchParams({ days: String(days) })
+  if (projectId) params.set('project_id', projectId)
+  return apiFetch<{ trends: QualityTrendData[]; days: number }>(`/api/quality/trends?${params}`)
+}
+
+export async function getQualitySummary() {
+  return apiFetch<{ summary: QualitySummary; latest: QualityReportRow | null }>('/api/quality/summary')
 }
 
 // ── Sessions ──

@@ -155,37 +155,72 @@ Submit a new knowledge item (requires approval by default).
 
 ---
 
-### `quality.*` — Quality Gates
+### `quality.*` — Quality Gates (4-Dimension Scoring)
 
-#### `quality.report`
+#### `cortex_quality_report`
 
-Submit a quality gate result after a work session.
+Submit a quality gate report with automatic 4-dimension scoring.
+
+**New format** (recommended — auto-calculates scores):
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `project` | string | ✓ | Project name |
-| `score` | number | ✓ | Quality score (0-100) |
-| `grade` | string | ✓ | Letter grade: A, B, C, D, F |
-| `breakdown` | object | — | Score breakdown by category |
+| `gate_name` | string | ✓ | Gate identifier (e.g., "pre-push", "CI") |
+| `agent_id` | string | — | Agent identifier (default: "unknown") |
+| `session_id` | string | — | Current session ID |
+| `project_id` | string | — | Project ID |
+| `results` | object | — | Raw verification results (see below) |
+| `details` | string | — | Markdown log of evaluation |
+
+**`results` object (triggers auto-scoring):**
+
+| Field | Type | Description |
+|---|---|---|
+| `buildPassed` | boolean | Build compiled successfully |
+| `typecheckPassed` | boolean | TypeScript type check passed |
+| `lintPassed` | boolean | Linter passed |
+| `testsPassed` | boolean | Test suite passed |
+| `testsBaseline` | number | Baseline test count |
+| `testsCurrent` | number | Current test count |
+| `isGreenfield` | boolean | New project (auto-grants regression) |
+| `stubsFound` | number | TODO/FIXME/HACK count |
+| `secretsFound` | number | Hardcoded secrets detected |
+| `lintErrorCount` | number | Lint error count |
+| `requirementsMapped` | number | Requirements covered |
+| `requirementsTotal` | number | Total requirements |
+| `hasTests` | boolean | Has tests for new code |
+| `hasDocs` | boolean | Has documentation |
+
+**Legacy format** (backward compatible):
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `gate_name` | string | ✓ | Gate name |
+| `passed` | boolean | — | Whether gate passed |
+| `score` | number | — | Pre-computed score (0-100) |
+
+**Scoring model:** Build (25) + Regression (25) + Standards (25) + Traceability (25) = 100
 
 **Grade thresholds:**
 
-| Grade | Score | Description |
+| Grade | Score | Action |
 |---|---|---|
-| A | 90-100 | Excellent — all gates passed |
-| B | 75-89 | Good — minor issues |
-| C | 60-74 | Acceptable — needs improvement |
-| D | 40-59 | Poor — significant issues |
-| F | 0-39 | Failing — blocked |
+| A | 90-100 | Proceed immediately |
+| B | 80-89 | Proceed with minor warnings |
+| C | 70-79 | Proceed but flag at next gate |
+| D | 60-69 | Pause — show report, ask user |
+| F | 0-59 | Stop — must remediate |
 
-#### `quality.trends`
+**REST API endpoints:**
 
-Get quality score trend for a project.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `project` | string | ✓ | Project name |
-| `days` | number | — | Lookback period (default: 30) |
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/quality/report` | POST | Submit quality gate report |
+| `/api/quality/reports` | GET | List reports (filter: `project_id`, `agent_id`, `grade`) |
+| `/api/quality/reports/latest` | GET | Most recent report |
+| `/api/quality/trends` | GET | Daily trends (`days`, `project_id`) |
+| `/api/quality/summary` | GET | Aggregate stats + grade distribution |
+| `/api/quality/logs` | GET | Legacy execution logs |
 
 ---
 

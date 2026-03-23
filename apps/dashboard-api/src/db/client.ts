@@ -58,6 +58,11 @@ try {
   db.exec("UPDATE index_jobs SET mem9_status = 'pending' WHERE mem9_status = 'done' AND (mem9_chunks IS NULL OR mem9_chunks = 0)")
 } catch (e) { /* ignore */ }
 
+// Reset stuck mem9 embedding: if status is 'embedding' for >30 min, it crashed/timed out
+try {
+  db.exec("UPDATE index_jobs SET mem9_status = 'error' WHERE mem9_status = 'embedding' AND completed_at < datetime('now', '-30 minutes')")
+} catch (e) { /* ignore */ }
+
 if (existsSync(schemaPath)) {
   const schema = readFileSync(schemaPath, 'utf8')
   db.exec(schema)
@@ -70,7 +75,7 @@ setInterval(() => {
   } catch { /* ignore */ }
 }, 60 * 60 * 1000)
 
-// Auto-cleanup: mark stale active sessions as completed (> 4 hours old)
+// Auto-cleanup: mark stale active sessions as completed (>4 hours old)
 setInterval(() => {
   try {
     db.prepare(
@@ -79,5 +84,18 @@ setInterval(() => {
     ).run()
   } catch { /* ignore */ }
 }, 30 * 60 * 1000) // check every 30 minutes
+
+// Auto-cleanup: reset stuck mem9 embedding jobs (>15 min old)
+setInterval(() => {
+  try {
+    const result = db.prepare(
+      `UPDATE index_jobs SET mem9_status = 'error'
+       WHERE mem9_status = 'embedding' AND completed_at < datetime('now', '-15 minutes')`
+    ).run()
+    if (result.changes > 0) {
+      console.warn(`[db] Reset ${result.changes} stuck mem9 embedding job(s)`)
+    }
+  } catch { /* ignore */ }
+}, 10 * 60 * 1000) // check every 10 minutes
 
 export { db }
