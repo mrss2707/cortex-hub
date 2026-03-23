@@ -130,6 +130,7 @@ echo -e "${BLUE}>>> Testing MCP connection...${NC}"
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
     -X POST "$MCP_URL" \
     -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
     -H "Authorization: Bearer $HUB_API_KEY" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' 2>/dev/null || echo "000")
 
@@ -260,6 +261,7 @@ inject_mcp_config() {
         echo -e "  ${CYAN}Example (curl):${NC}"
         echo -e "  curl -X POST '$MCP_URL' \\"
         echo -e "    -H 'Content-Type: application/json' \\"
+        echo -e "    -H 'Accept: application/json, text/event-stream' \\"
         echo -e "    -H 'Authorization: Bearer $HUB_API_KEY' \\"
         echo -e "    -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}'"
         echo ""
