@@ -200,19 +200,22 @@ app.all('/mcp', async (c) => {
 
     // Measure output size by cloning the response
     let outputSize = 0
+    let respBody = ''
     try {
       const cloned = response.clone()
-      const respText = await cloned.text()
-      outputSize = respText.length
+      respBody = await cloned.text()
+      outputSize = respBody.length
     } catch { /* ignore clone failures */ }
 
+    const apiUrl = (c.env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
+    const agentId = envWithOwner.API_KEY_OWNER || 'unknown'
+
     if (toolName !== 'unknown') {
-      const apiUrl = (c.env.DASHBOARD_API_URL || 'http://localhost:4000').replace(/\/$/, '')
       fetch(`${apiUrl}/api/metrics/query-log`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          agentId: envWithOwner.API_KEY_OWNER || 'unknown',
+          agentId,
           tool: toolName,
           params: argsObj,
           status: response.status >= 400 ? 'error' : 'ok',
@@ -222,6 +225,38 @@ app.all('/mcp', async (c) => {
           outputSize,
         })
       }).catch((err: any) => console.error('[MCP Telemetry Error]', err))
+    }
+
+    // ── Cortex Hints Injection (Solution 3) ──
+    // Fetch context-aware hints and inject into the response body
+    // This is the "hard enforcement" — agents MUST read hints because they're in the response
+    if (toolName !== 'unknown' && toolName !== 'cortex_health' && agentId !== 'unknown') {
+      try {
+        const hintsRes = await fetch(
+          `${apiUrl}/api/metrics/hints/${encodeURIComponent(agentId)}?currentTool=${encodeURIComponent(toolName)}`,
+          { signal: AbortSignal.timeout(2000) }
+        )
+        if (hintsRes.ok) {
+          const hintsData = (await hintsRes.json()) as { hints: string[] }
+          if (hintsData.hints.length > 0 && respBody) {
+            try {
+              const parsed = JSON.parse(respBody)
+              // MCP JSON-RPC response format: { jsonrpc: "2.0", result: { content: [...] } }
+              if (parsed.result?.content && Array.isArray(parsed.result.content)) {
+                const lastItem = parsed.result.content[parsed.result.content.length - 1]
+                if (lastItem?.type === 'text' && typeof lastItem.text === 'string') {
+                  lastItem.text += '\n\n---\n💡 Cortex hints:\n' + hintsData.hints.map((h: string) => `  ${h}`).join('\n')
+                }
+                const modifiedBody = JSON.stringify(parsed)
+                return new Response(modifiedBody, {
+                  status: response.status,
+                  headers: response.headers,
+                })
+              }
+            } catch { /* JSON parse failed, return original */ }
+          }
+        }
+      } catch { /* hints fetch failed, non-fatal */ }
     }
 
     return response

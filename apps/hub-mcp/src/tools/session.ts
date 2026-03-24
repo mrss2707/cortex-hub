@@ -56,8 +56,42 @@ export function registerSessionTools(server: McpServer, env: Env) {
           } catch { /* non-fatal: don't block session end */ }
         }
 
+        // ── Fetch compliance score for this session ──
+        let complianceReport = ''
+        try {
+          const complianceRes = await apiCall(env, `/api/metrics/session-compliance/${sessionId}`)
+          if (complianceRes.ok) {
+            const compliance = (await complianceRes.json()) as {
+              overallScore: number; grade: string
+              toolsUsed: string[]; totalUsed: number; totalRecommended: number
+              categories: Array<{ category: string; used: string[]; missing: string[]; score: number }>
+              hints: string[]
+            }
+
+            const lines: string[] = []
+            lines.push(`\n\n══════════════════════════════════════════`)
+            lines.push(`  CORTEX COMPLIANCE: ${compliance.grade} (${compliance.overallScore}%)`)
+            lines.push(`  Tools: ${compliance.totalUsed}/${compliance.totalRecommended} recommended`)
+            lines.push(`══════════════════════════════════════════`)
+
+            for (const cat of compliance.categories) {
+              const icon = cat.score === 100 ? '✅' : cat.score >= 50 ? '⚠️' : '❌'
+              lines.push(`${icon} ${cat.category}: ${cat.score}%${cat.missing.length > 0 ? ` (missing: ${cat.missing.join(', ')})` : ''}`)
+            }
+
+            if (compliance.hints.length > 0) {
+              lines.push(`\n📋 Improvement hints:`)
+              for (const hint of compliance.hints) {
+                lines.push(`  ${hint}`)
+              }
+            }
+
+            complianceReport = lines.join('\n')
+          }
+        } catch { /* non-fatal */ }
+
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) + complianceReport }],
         }
       } catch (error) {
         return {
