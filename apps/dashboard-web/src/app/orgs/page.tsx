@@ -168,7 +168,7 @@ function ProjectCard({
         </button>
       </div>
 
-      {/* GitNexus + Mem9 Status */}
+      {/* GitNexus + Mem9 + Knowledge Status */}
       {enriched ? (
         <div className={styles.indexStatusGrid}>
           <div className={styles.indexStatusRow}>
@@ -187,6 +187,19 @@ function ProjectCard({
               <span className={styles.indexStatusDetail}>
                 {formatNumber(enriched.mem9.chunks)} chunks
               </span>
+            )}
+          </div>
+          <div className={styles.indexStatusRow}>
+            <span className={styles.indexStatusLabel}>📚 Knowledge</span>
+            {enriched.knowledge.docs > 0 ? (
+              <>
+                <span className="badge badge-healthy">✓ {enriched.knowledge.docs} docs</span>
+                <span className={styles.indexStatusDetail}>
+                  {formatNumber(enriched.knowledge.chunks)} chunks
+                </span>
+              </>
+            ) : (
+              <span className="badge badge-muted">— None</span>
             )}
           </div>
         </div>

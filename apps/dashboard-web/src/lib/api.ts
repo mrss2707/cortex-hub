@@ -383,6 +383,10 @@ export interface ProjectSummary {
     status: string
     chunks: number
   }
+  knowledge: {
+    docs: number
+    chunks: number
+  }
   weeklyQueries: number
   activeSessions: number
   createdAt: string

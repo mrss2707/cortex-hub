@@ -125,6 +125,17 @@ statsRouter.get('/overview-v2', async (c) => {
         "SELECT COUNT(*) as count FROM session_handoffs WHERE project_id = ? AND status = 'active'"
       ).get(p.id) as { count: number }).count
 
+      // Knowledge documents for this project
+      let knowledgeDocs = 0
+      let knowledgeChunks = 0
+      try {
+        const kStats = db.prepare(
+          "SELECT COUNT(*) as docs, COALESCE(SUM(chunk_count), 0) as chunks FROM knowledge_documents WHERE project_id = ? AND status = 'active'"
+        ).get(p.id) as { docs: number; chunks: number }
+        knowledgeDocs = kStats.docs
+        knowledgeChunks = kStats.chunks
+      } catch { /* knowledge table may not exist yet */ }
+
       return {
         id: p.id,
         name: p.name,
@@ -142,6 +153,10 @@ statsRouter.get('/overview-v2', async (c) => {
           status: job.mem9_status ?? 'pending',
           chunks: job.mem9_chunks ?? 0,
         } : { status: 'none', chunks: 0 },
+        knowledge: {
+          docs: knowledgeDocs,
+          chunks: knowledgeChunks,
+        },
         weeklyQueries,
         activeSessions,
         createdAt: p.created_at,
