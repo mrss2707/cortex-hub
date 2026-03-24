@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-placeholder.svg">
-    <img src="docs/assets/logo-placeholder.svg" alt="Cortex Hub" width="100" />
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo.png">
+    <img src="docs/assets/logo.png" alt="Cortex Hub" width="120" />
   </picture>
 </p>
 
