@@ -465,3 +465,150 @@ statsRouter.get('/tool-analytics', (c) => {
     return c.json({ error: String(error) }, 500)
   }
 })
+
+// ── Session Compliance Check ──
+// Returns which Cortex tools were used/missed in a session, with a compliance score
+statsRouter.get('/session-compliance/:sessionId', (c) => {
+  const sessionId = c.req.param('sessionId')
+
+  try {
+    // Get session info to find agent_id and time range
+    const session = db.prepare(
+      'SELECT id, from_agent, created_at, status FROM session_handoffs WHERE id = ?'
+    ).get(sessionId) as { id: string; from_agent: string; created_at: string; status: string } | undefined
+
+    if (!session) return c.json({ error: 'Session not found' }, 404)
+
+    // Get all tool calls made by this agent since session started
+    const toolCalls = db.prepare(`
+      SELECT DISTINCT tool FROM query_logs 
+      WHERE agent_id = ? AND created_at >= ?
+      ORDER BY tool
+    `).all(session.from_agent, session.created_at) as Array<{ tool: string }>
+
+    const usedTools = new Set(toolCalls.map(t => t.tool))
+
+    // Define recommended tool categories
+    const recommendedTools = {
+      discovery: ['cortex_code_search', 'cortex_code_context', 'cortex_cypher'],
+      safety: ['cortex_code_impact', 'cortex_detect_changes'],
+      learning: ['cortex_knowledge_search', 'cortex_memory_search'],
+      contribution: ['cortex_knowledge_store', 'cortex_memory_store'],
+      lifecycle: ['cortex_session_start', 'cortex_session_end', 'cortex_quality_report'],
+    }
+
+    // Calculate per-category compliance
+    const categories = Object.entries(recommendedTools).map(([category, tools]) => {
+      const used = tools.filter(t => usedTools.has(t))
+      const missing = tools.filter(t => !usedTools.has(t))
+      return {
+        category,
+        used,
+        missing,
+        score: tools.length > 0 ? Math.round((used.length / tools.length) * 100) : 100,
+      }
+    })
+
+    // Overall compliance score
+    const totalRecommended = Object.values(recommendedTools).flat()
+    const totalUsed = totalRecommended.filter(t => usedTools.has(t))
+    const overallScore = Math.round((totalUsed.length / totalRecommended.length) * 100)
+
+    // Generate improvement hints
+    const hints: string[] = []
+    const missingDiscovery = categories.find(c => c.category === 'discovery')?.missing ?? []
+    const missingSafety = categories.find(c => c.category === 'safety')?.missing ?? []
+    const missingLearning = categories.find(c => c.category === 'learning')?.missing ?? []
+    const missingContribution = categories.find(c => c.category === 'contribution')?.missing ?? []
+
+    if (missingDiscovery.length > 0) {
+      hints.push(`🔍 Use ${missingDiscovery.join(', ')} BEFORE grep/find for AST-aware search`)
+    }
+    if (missingSafety.length > 0) {
+      hints.push(`🛡️ Use ${missingSafety.join(', ')} before editing core files to check blast radius`)
+    }
+    if (missingLearning.length > 0) {
+      hints.push(`📚 Use ${missingLearning.join(', ')} when encountering errors — someone may have solved it already`)
+    }
+    if (missingContribution.length > 0) {
+      hints.push(`💡 Use ${missingContribution.join(', ')} to share your findings with other agents`)
+    }
+
+    return c.json({
+      sessionId,
+      agent: session.from_agent,
+      overallScore,
+      grade: overallScore >= 80 ? 'A' : overallScore >= 60 ? 'B' : overallScore >= 40 ? 'C' : 'D',
+      toolsUsed: [...usedTools],
+      totalUsed: totalUsed.length,
+      totalRecommended: totalRecommended.length,
+      categories,
+      hints,
+    })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ── Cortex Hints Engine ──
+// Returns contextual hints based on which tools an agent has/hasn't used recently
+statsRouter.get('/hints/:agentId', (c) => {
+  const agentId = c.req.param('agentId')
+  const currentTool = c.req.query('currentTool')
+
+  try {
+    // Get tools used by this agent in the last 2 hours (current session window)
+    const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString().replace('T', ' ').substring(0, 19)
+    const recentTools = db.prepare(`
+      SELECT DISTINCT tool FROM query_logs 
+      WHERE agent_id = ? AND created_at >= ?
+    `).all(agentId, since) as Array<{ tool: string }>
+
+    const used = new Set(recentTools.map(t => t.tool))
+    const hints: string[] = []
+
+    // Context-aware hints based on current tool and what's missing
+    if (!used.has('cortex_session_start')) {
+      hints.push('⚠️ Start your session first: cortex_session_start tracks your work and enables compliance.')
+    }
+
+    if (currentTool === 'cortex_code_search' || currentTool === 'cortex_cypher' || currentTool === 'cortex_code_context') {
+      // Agent is doing code discovery — remind about impact checking
+      if (!used.has('cortex_code_impact')) {
+        hints.push('🛡️ Before editing, run cortex_code_impact to check blast radius of your changes.')
+      }
+    }
+
+    if (currentTool === 'cortex_quality_report') {
+      // Agent is reporting quality — check if they used discovery/safety tools
+      if (!used.has('cortex_code_search') && !used.has('cortex_cypher')) {
+        hints.push('🔍 You reported quality without using code search tools. Try cortex_code_search or cortex_cypher next time for better code understanding.')
+      }
+      if (!used.has('cortex_knowledge_store') && !used.has('cortex_memory_store')) {
+        hints.push('💡 Consider using cortex_knowledge_store or cortex_memory_store to share your findings.')
+      }
+    }
+
+    if (currentTool === 'cortex_session_end') {
+      // Session ending — give overall compliance hint
+      if (!used.has('cortex_quality_report')) {
+        hints.push('📊 You should call cortex_quality_report with build/typecheck/lint results before ending.')
+      }
+      if (!used.has('cortex_memory_store')) {
+        hints.push('🧠 Store what you learned: cortex_memory_store persists insights for your next session.')
+      }
+    }
+
+    // General hints based on low tool coverage
+    const discoveryTools = ['cortex_code_search', 'cortex_code_context', 'cortex_cypher']
+    const usedDiscovery = discoveryTools.filter(t => used.has(t)).length
+    if (usedDiscovery === 0 && used.size > 2) {
+      hints.push('🔍 You haven\'t used any code discovery tools yet. Try cortex_code_search before grep for better results.')
+    }
+
+    return c.json({ agentId, hints, toolsUsedCount: used.size })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
