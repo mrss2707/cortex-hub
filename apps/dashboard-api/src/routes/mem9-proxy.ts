@@ -64,7 +64,7 @@ function getMem9Config(): Mem9Config {
 /** Track the API key used to create singletons — invalidate if it changes */
 let lastApiKey = ''
 
-function getMem9(): Mem9 {
+export function getMem9(): Mem9 {
   const currentKey = resolveGeminiApiKey()
   if (!mem9Instance || currentKey !== lastApiKey) {
     lastApiKey = currentKey

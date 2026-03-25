@@ -14,7 +14,7 @@ At the START of every conversation, before doing anything else:
 
 2. If `recentChanges.count > 0` in the response, warn the user and run `git pull` before editing any affected files.
 
-3. Read `STATE.md` for current task progress (if it exists).
+3. Review `recentMemories` returned by `cortex_session_start` to understand current project progress and state.
 
 ### Before editing shared files
 

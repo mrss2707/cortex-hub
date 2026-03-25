@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { db } from '../db/client.js'
 import { randomUUID } from 'crypto'
+import { getMem9 } from './mem9-proxy.js'
 
 export const orgsRouter = new Hono()
 
@@ -327,6 +328,30 @@ projectsRouter.get('/lookup', (c) => {
 
     if (!project) return c.json({ error: 'Project not found' }, 404)
     return c.json(project)
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ── Get Project State from Memory ──
+projectsRouter.get('/:id/state', async (c) => {
+  const { id } = c.req.param()
+  try {
+    const mem9 = getMem9()
+    const result = await mem9.search({
+      query: `project ${id} recent session context progress task tracking`,
+      userId: `project-${id}`,
+      limit: 10,
+    })
+
+    const memories = result.memories ?? []
+    return c.json({
+      memories: memories.map((m: { memory?: string; score?: number }) => ({
+        content: m.memory ?? '',
+        score: m.score ?? 0,
+      })),
+      tokensUsed: result.tokensUsed || 0,
+    })
   } catch (error) {
     return c.json({ error: String(error) }, 500)
   }

@@ -333,9 +333,18 @@ export async function createProject(orgId: string, data: {
 }
 
 export async function getProject(id: string) {
-  return apiFetch<Project & { stats: { apiKeys: number; queryLogs: number; sessions: number } }>(
+  return apiFetch<Project & { stats: { apiKeys: number; queryLogs: number; sessions: number }; activity: Record<string, unknown>[] }>(
     `/api/projects/${id}`
   )
+}
+
+export interface ProjectStateResponse {
+  memories: { content: string; score: number }[]
+  tokensUsed: number
+}
+
+export async function getProjectState(id: string) {
+  return apiFetch<ProjectStateResponse>(`/api/projects/${id}/state`)
 }
 
 export async function updateProject(id: string, data: {

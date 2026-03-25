@@ -10,6 +10,7 @@ import {
   listBranches, getBranchDiff, getBranchIndexSummary, testGitConnection,
   startMemNineEmbedding, buildDocsKnowledge,
   type IndexStatus, type IndexJobSummary, type BranchIndexStatus,
+  getProjectState, type ProjectStateResponse,
 } from '@/lib/api'
 import styles from './page.module.css'
 
@@ -44,6 +45,37 @@ function formatRelativeTime(dateStr: string): string {
   if (days < 7) return `${days}d ago`
   const d = new Date(dateStr)
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function ProjectStatePanel({ projectId }: { projectId: string }) {
+  const { data, isLoading, error } = useSWR<ProjectStateResponse>(
+    projectId ? `project-state-${projectId}` : null,
+    () => getProjectState(projectId),
+    { refreshInterval: 15000 }
+  )
+
+  if (isLoading) return <div className={`card ${styles.stateCard}`}>Loading memory state...</div>
+  if (error) return <div className={`card ${styles.stateCard}`}>Failed to load state</div>
+
+  const memories = data?.memories ?? []
+
+  return (
+    <div className={`card ${styles.stateCard}`}>
+      <h3 className={styles.infoTitle}>🧠 Project Memory State</h3>
+      {memories.length === 0 ? (
+        <p className={styles.emptyHint}>No recent progress memories found for this project.</p>
+      ) : (
+        <div className={styles.stateList}>
+          {memories.map((m, i) => (
+            <div key={i} className={styles.stateRow}>
+              <div className={styles.stateContent}>{m.content}</div>
+              <div className={styles.stateMeta}>Score: {m.score !== undefined ? m.score.toFixed(3) : 'N/A'}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function IndexingPanel({ projectId, hasGitUrl }: { projectId: string; hasGitUrl: boolean }) {
@@ -746,6 +778,8 @@ function ProjectContent() {
       {/* Indexing Panel */}
       <IndexingPanel projectId={projectId} hasGitUrl={!!project.git_repo_url} />
 
+      {/* Project Memory State */}
+      <ProjectStatePanel projectId={projectId} />
 
       {/* Recent Activity */}
       <div className={`card ${styles.activityCard}`}>
