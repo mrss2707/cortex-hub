@@ -39,3 +39,12 @@ infra/docker-compose*.yml
 **/*.spec.ts
 **/vitest.config.ts
 coverage
+
+# ── Data & Secrets (CRITICAL) ──
+data
+**/data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+**/provider_accounts.json
