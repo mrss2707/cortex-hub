@@ -15,7 +15,7 @@
    cortex_session_start({ repo: "<repo URL>", mode: "development" })
    ```
    Save the returned `sessionId` — needed for session close at end.
-1. **Read `STATE.md`** → current task & progress
+1. **Review Context** → check `recentMemories` from session start for project progress
 2. **Read `.cortex/project-profile.json`** → `verify` commands & fingerprint
 3. **Run `/onboard`** (only if first session or Hub credentials missing/broken) → sync MCP, rules, and local audit
 4. **Acknowledge context:** "Phase X, resuming: [task]. Standards: SOLID, Clean Architecture. Verify: [profile commands]"
@@ -27,7 +27,7 @@
    - `pnpm typecheck`
    - `pnpm lint`
 2. **Report quality:** `Build ✅/❌ | Typecheck ✅/❌ | Lint ✅/❌`
-3. **Update `STATE.md`** with progress, completed tasks, new decisions
+3. **Store memory of progress** — call `cortex_memory_store` to record completed tasks and new decisions
 4. **Commit** with conventional prefix: `feat:`, `fix:`, `docs:`, `chore:`
 5. **Close session** — call `cortex_quality_report` with final gate status
 6. **Store memories** — call `cortex_memory_store` for any new knowledge learned during the session (debugging findings, architecture decisions, deployment gotchas, etc.)
@@ -120,14 +120,14 @@ Cortex Hub is a self-hosted, MCP-compliant platform that unifies code intelligen
 
 | User Pattern | Mode | Auto-Actions |
 |-------------|------|-------------|
-| "phase N" / "start phase N" / "bắt đầu phase N" | Phase Build | Read STATE.md → gate check → DEFINE → PLAN → EXECUTE → VERIFY |
-| "continue" / "tiếp" / "go" / "tiếp tục" | Resume | Read STATE.md → resume `[/]` task → EXECUTE → VERIFY |
+| "phase N" / "start phase N" / "bắt đầu phase N" | Phase Build | Read Memory State → gate check → DEFINE → PLAN → EXECUTE → VERIFY |
+| "continue" / "tiếp" / "go" / "tiếp tục" | Resume | Read Memory State → resume task → EXECUTE → VERIFY |
 | "add X" / "implement X" / "thêm X" / "làm X" | Feature | Read profile → PLAN → get approval → EXECUTE → VERIFY |
 | "fix X" / "sửa X" / "debug X" | Debug | Locate issue → fix → run verify.pre_commit |
 | "deploy" / "ship" / "đẩy lên" | Deploy | Run verify.full → deploy from profile → verify live |
 | "onboard" / "setup" / "cài đặt" | Setup | Run scripts/onboard.sh or scripts/install-hub.sh |
 | "review" / "check" / "kiểm tra" | Review | Run verify.full → check conventions → report |
-| ANY other message in cortex-hub workspace | Session Init | `cortex_session_start` → Read STATE.md → acknowledge context → then respond |
+| ANY other message in cortex-hub workspace | Session Init | `cortex_session_start` → Read Memory State → acknowledge context → then respond |
 
 ---
 
@@ -165,7 +165,7 @@ DEFINE   → Read BRD epics + requirements for this phase
 PLAN     → Create/update implementation plan, get user approval
 EXECUTE  → Write code, follow code-conventions.md
 VERIFY   → Run verify commands from project-profile.json
-COMMIT   → Conventional commit, update STATE.md
+COMMIT   → Conventional commit, store memory
 ```
 
 ---
@@ -208,7 +208,7 @@ Every code session MUST end with verification from `project-profile.json`:
 
 | Document | Path |
 |----------|------|
-| **STATE.md** | `STATE.md` (read FIRST every session) |
+| **Session Memory** | Auto-fetched by `cortex_session_start` |
 | **Project Profile** | `.cortex/project-profile.json` (verify commands) |
 | **Code Conventions** | `.cortex/code-conventions.md` |
 | MCP Tool Reference | `docs/api/hub-mcp-reference.md` |
