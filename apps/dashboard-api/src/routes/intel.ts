@@ -477,62 +477,69 @@ intelRouter.post('/context', async (c) => {
   }
 })
 
+/**
+ * Fetch and parse GitNexus repositories, enriched with project DB metadata.
+ */
+export async function getGitNexusRepos() {
+  const gitNexusResult = await callGitNexus('list_repos', {})
+
+  // Enrich with project DB data for project ID mapping
+  const projects = db.prepare(
+    'SELECT id, slug, name, git_repo_url, indexed_symbols FROM projects'
+  ).all() as Array<{ id: string; slug: string; name: string; git_repo_url: string | null; indexed_symbols: number | null }>
+
+  // Build a lookup for matching by slug or repo URL basename
+  const projectBySlug = new Map<string, typeof projects[0]>()
+  const projectById = new Map<string, typeof projects[0]>()
+  for (const p of projects) {
+    projectBySlug.set(p.slug?.toLowerCase(), p)
+    projectById.set(p.id, p)
+    // Also map by git URL basename (e.g., "cortex-hub" from github.com/lktiep/cortex-hub.git)
+    if (p.git_repo_url) {
+      const basename = p.git_repo_url.replace(/\.git$/, '').split('/').pop()?.toLowerCase()
+      if (basename && !projectBySlug.has(basename)) {
+        projectBySlug.set(basename, p)
+      }
+    }
+  }
+
+  // Parse GitNexus raw response — may be array, object with repos, or raw text
+  let repos: Array<{ name: string; projectId: string; slug: string; symbols: number | string; gitUrl: string }> = []
+
+  const rawData = gitNexusResult as Record<string, unknown>
+  if (rawData?.raw && typeof rawData.raw === 'string') {
+    // Raw text: parse repo names from lines
+    const repoNames = rawData.raw.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+    repos = repoNames.map(name => {
+      const match = projectBySlug.get(name.toLowerCase()) ?? projectById.get(name)
+      return {
+        name,
+        projectId: match?.id ?? '',
+        slug: match?.slug ?? name,
+        symbols: match?.indexed_symbols ?? '?',
+        gitUrl: match?.git_repo_url ?? '',
+      }
+    })
+  } else if (Array.isArray(rawData)) {
+    repos = rawData.map((r: unknown) => {
+      const name = typeof r === 'string' ? r : ((r as Record<string, string>).name ?? 'unknown')
+      const match = projectBySlug.get(name.toLowerCase()) ?? projectById.get(name)
+      return {
+        name,
+        projectId: match?.id ?? '',
+        slug: match?.slug ?? name,
+        symbols: match?.indexed_symbols ?? '?',
+        gitUrl: match?.git_repo_url ?? '',
+      }
+    })
+  }
+  return repos
+}
+
 // ── List Repos: discover indexed repositories with project mapping ──
 intelRouter.get('/repos', async (c) => {
   try {
-    const gitNexusResult = await callGitNexus('list_repos', {})
-
-    // Enrich with project DB data for project ID mapping
-    const projects = db.prepare(
-      'SELECT id, slug, name, git_repo_url, indexed_symbols FROM projects'
-    ).all() as Array<{ id: string; slug: string; name: string; git_repo_url: string | null; indexed_symbols: number | null }>
-
-    // Build a lookup for matching by slug or repo URL basename
-    const projectBySlug = new Map<string, typeof projects[0]>()
-    const projectById = new Map<string, typeof projects[0]>()
-    for (const p of projects) {
-      projectBySlug.set(p.slug?.toLowerCase(), p)
-      projectById.set(p.id, p)
-      // Also map by git URL basename (e.g., "cortex-hub" from github.com/lktiep/cortex-hub.git)
-      if (p.git_repo_url) {
-        const basename = p.git_repo_url.replace(/\.git$/, '').split('/').pop()?.toLowerCase()
-        if (basename && !projectBySlug.has(basename)) {
-          projectBySlug.set(basename, p)
-        }
-      }
-    }
-
-    // Parse GitNexus raw response — may be array, object with repos, or raw text
-    let repos: Array<{ name: string; projectId: string; slug: string; symbols: number | string; gitUrl: string }> = []
-
-    const rawData = gitNexusResult as Record<string, unknown>
-    if (rawData?.raw && typeof rawData.raw === 'string') {
-      // Raw text: parse repo names from lines
-      const repoNames = rawData.raw.split('\n').map(l => l.trim()).filter(l => l.length > 0)
-      repos = repoNames.map(name => {
-        const match = projectBySlug.get(name.toLowerCase()) ?? projectById.get(name)
-        return {
-          name,
-          projectId: match?.id ?? '',
-          slug: match?.slug ?? name,
-          symbols: match?.indexed_symbols ?? '?',
-          gitUrl: match?.git_repo_url ?? '',
-        }
-      })
-    } else if (Array.isArray(rawData)) {
-      repos = rawData.map((r: unknown) => {
-        const name = typeof r === 'string' ? r : ((r as Record<string, string>).name ?? 'unknown')
-        const match = projectBySlug.get(name.toLowerCase()) ?? projectById.get(name)
-        return {
-          name,
-          projectId: match?.id ?? '',
-          slug: match?.slug ?? name,
-          symbols: match?.indexed_symbols ?? '?',
-          gitUrl: match?.git_repo_url ?? '',
-        }
-      })
-    }
-
+    const repos = await getGitNexusRepos()
     return c.json({ success: true, data: repos })
   } catch (error) {
     logger.error(`List repos failed: ${String(error)}`)

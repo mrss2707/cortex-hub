@@ -58,8 +58,18 @@ statsRouter.get('/overview', async (c) => {
 })
 
 // ── Enriched Overview (v2) — single call for dashboard ──
+import { getGitNexusRepos } from './intel.js'
+
 statsRouter.get('/overview-v2', async (c) => {
   try {
+    // ── Pre-fetch GitNexus native repos ──
+    let gitNexusRepos: Array<{ projectId: string; symbols: number | string }> = []
+    try {
+      gitNexusRepos = await getGitNexusRepos()
+    } catch (e) {
+      console.warn('[overview-v2] gitnexus list_repos error:', e)
+    }
+
     // ── Basic counts ──
     const keyCount = (db.prepare('SELECT COUNT(*) as count FROM api_keys').get() as { count: number }).count
     const agentCount = (db.prepare('SELECT COUNT(DISTINCT agent_id) as count FROM query_logs').get() as { count: number }).count
@@ -143,13 +153,28 @@ statsRouter.get('/overview-v2', async (c) => {
         slug: p.slug,
         gitProvider: p.git_provider,
         gitRepoUrl: p.git_repo_url,
-        gitnexus: job ? {
-          status: job.status,
-          symbols: job.symbols_found ?? p.indexed_symbols ?? 0,
-          files: job.total_files ?? 0,
-          branch: job.branch,
-          completedAt: job.completed_at,
-        } : { status: 'none', symbols: 0, files: 0, branch: null, completedAt: null },
+        gitnexus: (() => {
+          if (job) {
+            return {
+              status: job.status,
+              symbols: job.symbols_found ?? p.indexed_symbols ?? 0,
+              files: job.total_files ?? 0,
+              branch: job.branch,
+              completedAt: job.completed_at,
+            }
+          }
+          const nativeJob = gitNexusRepos.find(r => r.projectId === p.id)
+          if (nativeJob) {
+            return {
+              status: 'done',
+              symbols: typeof nativeJob.symbols === 'number' ? nativeJob.symbols : p.indexed_symbols ?? 0,
+              files: p.indexed_symbols ?? 0,
+              branch: 'main',
+              completedAt: p.created_at,
+            }
+          }
+          return { status: 'none', symbols: 0, files: 0, branch: null, completedAt: null }
+        })(),
         mem9: job ? {
           status: job.mem9_status ?? 'pending',
           chunks: job.mem9_chunks ?? 0,
