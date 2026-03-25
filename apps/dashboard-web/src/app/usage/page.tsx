@@ -197,7 +197,7 @@ export default function UsagePage() {
   const { data: byAgent, mutate: mutateAgent } = useSWR('usage-by-agent', getUsageByAgent, {
     refreshInterval: 30000,
   })
-  const { data: historyData, mutate: mutateHistory } = useSWR('usage-history', () => getUsageHistory(7), {
+  const { data: historyData, mutate: mutateHistory } = useSWR('usage-history', () => getUsageHistory(90), {
     refreshInterval: 30000,
   })
 
@@ -209,22 +209,39 @@ export default function UsagePage() {
   const agents = byAgent?.agents ?? []
   const history = historyData?.history ?? []
 
-  // Pad history to 7 days if needed
-  const dailyTrend = (() => {
+  // Pad history to 90 days for heatmap
+  const heatmapTrend = (() => {
     const dayMap = new Map(history.map((h) => [h.day, h]))
-    const days: { day: string; requests: number; tokens: number }[] = []
-    for (let i = 6; i >= 0; i--) {
+    const days: { day: string; dateObj: Date; requests: number; tokens: number }[] = []
+    for (let i = 89; i >= 0; i--) {
       const d = new Date()
       d.setDate(d.getDate() - i)
       const dayStr = d.toISOString().split('T')[0] ?? ''
       const existing = dayMap.get(dayStr)
-      days.push({ day: dayStr, requests: existing?.requests ?? 0, tokens: existing?.tokens ?? 0 })
+      days.push({ day: dayStr, dateObj: d, requests: existing?.requests ?? 0, tokens: existing?.tokens ?? 0 })
     }
     return days
   })()
 
-  const maxDaily = Math.max(...dailyTrend.map((d) => d.requests), 1)
+  const dailyTrend14 = heatmapTrend.slice(-14)
+  const maxDaily14 = Math.max(...dailyTrend14.map((d) => d.requests), 1)
   const totalModelRequests = models.reduce((s, m) => s + m.requests, 0) || 1
+
+  // Heatmap columns (weeks)
+  const maxHeatmapDaily = Math.max(...heatmapTrend.map(d => d.requests), 1)
+  const heatmapCols: typeof heatmapTrend[] = []
+  for (let i = 0; i < heatmapTrend.length; i += 7) {
+    heatmapCols.push(heatmapTrend.slice(i, i + 7))
+  }
+
+  function getHeatmapLevel(val: number, max: number) {
+    if (val === 0) return 0
+    const pct = val / max
+    if (pct < 0.25) return 1
+    if (pct < 0.5) return 2
+    if (pct < 0.75) return 3
+    return 4
+  }
 
   function refreshAll() {
     mutateSummary()
@@ -273,10 +290,10 @@ export default function UsagePage() {
         </div>
       </div>
 
-      {/* 7-Day Trend */}
+      {/* Trend & Heatmap */}
       <div className={styles.section}>
         <div className={styles.sectionHeader}>
-          <h2 className={styles.sectionTitle}>7-Day Trend</h2>
+          <h2 className={styles.sectionTitle}>Activity Trends</h2>
           <button
             className="btn btn-secondary btn-sm"
             onClick={refreshAll}
@@ -285,22 +302,63 @@ export default function UsagePage() {
             {summaryLoading ? 'Loading…' : 'Refresh'}
           </button>
         </div>
+        
         <div className={`card ${styles.trendCard}`}>
+          {/* 14-Day Bar Chart */}
           <div className={styles.trendChart}>
-            {dailyTrend.map((point) => (
+            {dailyTrend14.map((point) => (
               <div key={point.day} className={styles.trendColumn}>
-                <span className={styles.trendCount}>{point.requests}</span>
+                <span className={styles.trendCount}>{point.requests > 0 ? point.requests : ''}</span>
                 <div className={styles.trendBarWrapper}>
                   <div
                     className={styles.trendBar}
-                    style={{ height: `${(point.requests / maxDaily) * 100}%` }}
+                    style={{ height: `${Math.max((point.requests / maxDaily14) * 100, 2)}%` }}
                   />
                 </div>
                 <span className={styles.trendDay}>
-                  {new Date(point.day + 'T12:00:00').toLocaleDateString('en', { weekday: 'short' })}
+                  {new Date(point.day + 'T12:00:00').toLocaleDateString('en', { weekday: 'narrow' })}
                 </span>
+                <div className={styles.heatmapTooltip}>
+                  <strong>{point.day}</strong>
+                  <br />
+                  {point.requests} requests ({formatNumber(point.tokens)} tokens)
+                </div>
               </div>
             ))}
+          </div>
+
+          {/* 90-Day Heatmap Calendar */}
+          <div className={styles.heatmapContainer}>
+            <div className={styles.heatmapHeader}>
+              <h3 className={styles.heatmapTitle}>90-Day History</h3>
+              <div className={styles.heatmapLegend}>
+                Less
+                {[0,1,2,3,4].map(level => (
+                  <div key={level} className={`${styles.heatmapCell} ${styles.heatmapLegendCell} ${styles['heatmapLevel' + level]}`} />
+                ))}
+                More
+              </div>
+            </div>
+            <div className={styles.heatmapGridWrapper}>
+              <div className={styles.heatmapGrid}>
+                {heatmapCols.map((col, cIdx) => (
+                  <div key={cIdx} className={styles.heatmapCol}>
+                    {col.map((cell) => {
+                      const level = getHeatmapLevel(cell.requests, maxHeatmapDaily)
+                      return (
+                        <div key={cell.day} className={`${styles.heatmapCell} ${styles['heatmapLevel' + level]}`}>
+                          <div className={styles.heatmapTooltip}>
+                            <strong>{new Date(cell.day + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</strong>
+                            <br />
+                            {cell.requests} requests ({formatNumber(cell.tokens)} tokens)
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       </div>
