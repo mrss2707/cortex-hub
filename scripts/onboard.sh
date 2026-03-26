@@ -315,7 +315,7 @@ inject_mcp_config() {
         python3 -c "
 import json
 path = '$config_path'
-with open(path, 'r') as f: config = json.load(f)
+with open(path, 'r', encoding='utf-8-sig') as f: config = json.load(f)
 if '$config_key' not in config: config['$config_key'] = {}
 config['$config_key']['cortex-hub'] = {
     'command': 'npx',
@@ -332,7 +332,7 @@ print('    Injected cortex-hub into $config_key')
         python3 -c "
 import json
 path = '$config_path'
-with open(path, 'r') as f: config = json.load(f)
+with open(path, 'r', encoding='utf-8-sig') as f: config = json.load(f)
 if '$config_key' not in config: config['$config_key'] = {}
 config['$config_key']['cortex-hub'] = {
     'type': 'stdio',
@@ -364,7 +364,7 @@ print('    Injected cortex-hub into $config_key')
         python3 -c "
 import json
 path = '$config_path'
-with open(path, 'r') as f: config = json.load(f)
+with open(path, 'r', encoding='utf-8-sig') as f: config = json.load(f)
 if '$config_key' not in config: config['$config_key'] = {}
 config['$config_key']['cortex-hub'] = {
     'command': 'npx',
@@ -612,7 +612,7 @@ for tool_key in "${SELECTED_TOOLS[@]}"; do
                 # File exists with markers — replace content between markers
                 python3 -c "
 import re
-with open('$GEMINI_FILE', 'r') as f:
+with open('$GEMINI_FILE', 'r', encoding='utf-8-sig') as f:
     content = f.read()
 marker = '$CORTEX_MARKER'
 pattern = re.escape(marker) + r'.*?' + re.escape(marker)
@@ -684,19 +684,19 @@ if [ -f "package.json" ]; then
     fi
 
     # Detect scripts from package.json
-    if python3 -c "import json; s=json.load(open('package.json')).get('scripts',{}); exit(0 if 'build' in s else 1)" 2>/dev/null; then
+    if python3 -c "import json; s=json.load(open('package.json', encoding='utf-8-sig')).get('scripts',{}); exit(0 if 'build' in s else 1)" 2>/dev/null; then
         BUILD_CMD="$PKG_MANAGER build"
     fi
-    if python3 -c "import json; s=json.load(open('package.json')).get('scripts',{}); exit(0 if 'typecheck' in s else 1)" 2>/dev/null; then
+    if python3 -c "import json; s=json.load(open('package.json', encoding='utf-8-sig')).get('scripts',{}); exit(0 if 'typecheck' in s else 1)" 2>/dev/null; then
         TYPECHECK_CMD="$PKG_MANAGER typecheck"
     fi
-    if python3 -c "import json; s=json.load(open('package.json')).get('scripts',{}); exit(0 if 'lint' in s else 1)" 2>/dev/null; then
+    if python3 -c "import json; s=json.load(open('package.json', encoding='utf-8-sig')).get('scripts',{}); exit(0 if 'lint' in s else 1)" 2>/dev/null; then
         LINT_CMD="$PKG_MANAGER lint"
     fi
-    if python3 -c "import json; s=json.load(open('package.json')).get('scripts',{}); exit(0 if 'test' in s else 1)" 2>/dev/null; then
+    if python3 -c "import json; s=json.load(open('package.json', encoding='utf-8-sig')).get('scripts',{}); exit(0 if 'test' in s else 1)" 2>/dev/null; then
         TEST_CMD="$PKG_MANAGER test"
     fi
-    if python3 -c "import json; s=json.load(open('package.json')).get('scripts',{}); exit(0 if 'format' in s else 1)" 2>/dev/null; then
+    if python3 -c "import json; s=json.load(open('package.json', encoding='utf-8-sig')).get('scripts',{}); exit(0 if 'format' in s else 1)" 2>/dev/null; then
         FORMAT_CMD="$PKG_MANAGER format"
     fi
 elif [ -f "go.mod" ]; then
@@ -792,7 +792,7 @@ if [ -f "$PROFILE_PATH" ]; then
     python3 -c "
 import json
 
-with open('$PROFILE_PATH') as f:
+with open('$PROFILE_PATH', encoding='utf-8-sig') as f:
     profile = json.load(f)
 
 verify = profile.get('verify', {})
@@ -1037,7 +1037,7 @@ hooks_config = {
 existing = {}
 if os.path.exists(settings_path):
     try:
-        with open(settings_path) as f:
+        with open(settings_path, encoding='utf-8-sig') as f:
             existing = json.load(f)
     except (json.JSONDecodeError, IOError):
         existing = {}
@@ -1244,7 +1244,7 @@ hooks_config = {
 existing = {}
 if os.path.exists(settings_path):
     try:
-        with open(settings_path) as f:
+        with open(settings_path, encoding='utf-8-sig') as f:
             existing = json.load(f)
     except (json.JSONDecodeError, IOError):
         existing = {}
