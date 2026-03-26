@@ -473,7 +473,7 @@ inject_instructions_to_file() {
     fi
 }
 
-# Antigravity-specific: enriched GEMINI.md with full tool enforcement
+# Antigravity-specific: enriched AGENTS.md with full tool enforcement
 generate_antigravity_instructions() {
     cat <<'ANTIGRAVITYEOF'
 
@@ -601,11 +601,11 @@ for tool_key in "${SELECTED_TOOLS[@]}"; do
             inject_instructions_to_file ".vscode/copilot-instructions.md" "vscode-copilot" ".vscode/copilot-instructions.md"
             ;;
         antigravity)
-            # Antigravity gets enriched GEMINI.md with full tool enforcement
+            # Antigravity gets enriched AGENTS.md with full tool enforcement
             # Uses marker-based injection: replaces content between cortex markers,
             # preserving any user content outside the markers.
-            echo -e "${BLUE}>>> Generating enriched GEMINI.md for Antigravity...${NC}"
-            GEMINI_FILE="GEMINI.md"
+            echo -e "${BLUE}>>> Injecting enriched tool references into AGENTS.md...${NC}"
+            GEMINI_FILE="AGENTS.md"
             ANTIGRAVITY_CONTENT=$(generate_antigravity_instructions)
 
             if [ -f "$GEMINI_FILE" ] && grep -q "$CORTEX_MARKER" "$GEMINI_FILE" 2>/dev/null; then
@@ -620,14 +620,14 @@ replacement = '''$ANTIGRAVITY_CONTENT'''
 new_content = re.sub(pattern, replacement.strip(), content, flags=re.DOTALL)
 with open('$GEMINI_FILE', 'w') as f:
     f.write(new_content)
-print('    Updated cortex section (preserved other content)')
+print('    Updated cortex section in AGENTS.md (preserved other content)')
 "
             else
-                # File doesn't exist or no markers — write fresh
-                echo "$ANTIGRAVITY_CONTENT" > "$GEMINI_FILE"
-                echo -e "    Created $GEMINI_FILE"
+                # File doesn't exist or no markers — append fresh to AGENTS.md
+                echo "$ANTIGRAVITY_CONTENT" >> "$GEMINI_FILE"
+                echo -e "    Appended to $GEMINI_FILE"
             fi
-            echo -e "${GREEN}>>> GEMINI.md updated with full tool reference${NC}"
+            echo -e "${GREEN}>>> AGENTS.md updated with full tool reference${NC}"
             ;;
         bot)
             echo -e "${YELLOW}>>> Bot mode: agentId should be passed via API call${NC}"
@@ -1432,5 +1432,5 @@ fi
 if [ "$INSTALL_GEMINI_HOOKS" = true ]; then
 echo -e "      ${YELLOW}├─ Gemini hooks: commit BLOCKED, session reminders (4 hooks)${NC}"
 fi
-echo -e "      ${YELLOW}└─ Instructions: CLAUDE.md / GEMINI.md / .cursorrules${NC}"
+echo -e "      ${YELLOW}└─ Instructions: CLAUDE.md / AGENTS.md / .cursorrules${NC}"
 echo -e "${BLUE}>>> Happy Coding!${NC}"
