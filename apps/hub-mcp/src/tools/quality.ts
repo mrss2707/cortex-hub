@@ -123,7 +123,7 @@ export function registerQualityTools(server: McpServer, env: Env) {
       request: z.string().describe('The original user request this plan addresses'),
       iteration: z.number().optional().describe('Iteration number (1-3, default 1)'),
       threshold: z.number().optional().describe('Minimum score to pass (default 8.0)'),
-      plan_type: z.enum(['feature', 'bugfix', 'refactor', 'architecture', 'migration', 'general']).optional(),
+      plan_type: z.enum(['feature', 'bugfix', 'refactor', 'architecture', 'migration', 'general']).optional().describe('Type of plan. MUST be one of: feature, bugfix, refactor, architecture, migration, general'),
     },
     async ({ plan, request, iteration, threshold, plan_type }) => {
       try {
