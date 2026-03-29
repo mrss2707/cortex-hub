@@ -122,20 +122,10 @@ if ((Test-Path $ClaudeJson) -and (Select-String -Path $ClaudeJson -Pattern "cort
         $McpUrl = if ($env:HUB_MCP_URL) { $env:HUB_MCP_URL } else { $MCP_URL_DEFAULT }
         Write-Info "Configuring MCP in ~/.claude.json..."
 
-        python3 -c @"
-import json, os
-path = os.path.join(os.environ['USERPROFILE'], '.claude.json')
-config = {}
-if os.path.exists(path):
-    with open(path) as f: config = json.load(f)
-if 'mcpServers' not in config: config['mcpServers'] = {}
-config['mcpServers']['cortex-hub'] = {
-    'command': 'npx',
-    'args': ['-y', 'mcp-remote', '$McpUrl', '--header', 'Authorization:`${AUTH_HEADER}'],
-    'env': {'AUTH_HEADER': 'Bearer $ApiKey'}
-}
-with open(path, 'w') as f: json.dump(config, f, indent=2)
-"@
+        $env:_CORTEX_MCP_URL = $McpUrl
+        $env:_CORTEX_API_KEY = $ApiKey
+        python3 -c "import json,os;p=os.path.join(os.environ['USERPROFILE'],'.claude.json');c=json.load(open(p)) if os.path.exists(p) else {};c.setdefault('mcpServers',{});c['mcpServers']['cortex-hub']={'command':'npx','args':['-y','mcp-remote',os.environ['_CORTEX_MCP_URL'],'--header','Authorization:$'+'{AUTH_HEADER}'],'env':{'AUTH_HEADER':'Bearer '+os.environ['_CORTEX_API_KEY']}};json.dump(c,open(p,'w'),indent=2)"
+        Remove-Item Env:\_CORTEX_MCP_URL, Env:\_CORTEX_API_KEY -ErrorAction SilentlyContinue
         $McpConfigured = $true
         Write-Ok "MCP: configured with provided API key"
 
@@ -144,21 +134,12 @@ with open(path, 'w') as f: json.dump(config, f, indent=2)
             param([string]$Path, [string]$RootKey, [string]$Label)
             $dir = Split-Path $Path -Parent
             if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-            $escapedPath = $Path -replace '\\', '/'
-            python3 -c @"
-import json, os
-path = '$escapedPath'
-config = {}
-if os.path.exists(path):
-    with open(path) as f: config = json.load(f)
-if '$RootKey' not in config: config['$RootKey'] = {}
-config['$RootKey']['cortex-hub'] = {
-    'command': 'npx',
-    'args': ['-y', 'mcp-remote', '$McpUrl', '--header', 'Authorization:`${AUTH_HEADER}'],
-    'env': {'AUTH_HEADER': 'Bearer $ApiKey'}
-}
-with open(path, 'w') as f: json.dump(config, f, indent=2)
-"@
+            $env:_MCP_PATH = ($Path -replace '\\', '/')
+            $env:_MCP_KEY = $RootKey
+            $env:_MCP_URL = $McpUrl
+            $env:_MCP_APIKEY = $ApiKey
+            python3 -c "import json,os;p=os.environ['_MCP_PATH'];k=os.environ['_MCP_KEY'];c=json.load(open(p)) if os.path.exists(p) else {};c.setdefault(k,{});c[k]['cortex-hub']={'command':'npx','args':['-y','mcp-remote',os.environ['_MCP_URL'],'--header','Authorization:$'+'{AUTH_HEADER}'],'env':{'AUTH_HEADER':'Bearer '+os.environ['_MCP_APIKEY']}};json.dump(c,open(p,'w'),indent=2)"
+            Remove-Item Env:\_MCP_PATH, Env:\_MCP_KEY, Env:\_MCP_URL, Env:\_MCP_APIKEY -ErrorAction SilentlyContinue
             Write-Ok "MCP: configured $Label"
         }
 
@@ -175,17 +156,12 @@ with open(path, 'w') as f: json.dump(config, f, indent=2)
             Set-McpConfig -Path ".vscode\mcp.json" -RootKey "servers" -Label "VS Code"
         }
         if (Test-IDESelected "codex") {
-            # Codex uses TOML — append if not present
             $codexConfig = Join-Path $env:USERPROFILE ".codex\config.toml"
             $codexDir = Split-Path $codexConfig -Parent
             if (-not (Test-Path $codexDir)) { New-Item -ItemType Directory -Path $codexDir -Force | Out-Null }
             if (-not (Test-Path $codexConfig) -or -not (Select-String -Path $codexConfig -Pattern "cortex-hub" -Quiet)) {
-                Add-Content -Path $codexConfig -Value @"
-
-[mcp_servers.cortex-hub]
-command = "npx"
-args = ["-y", "mcp-remote", "$McpUrl", "--header", "Authorization:Bearer $ApiKey"]
-"@
+                $tomlBlock = "`n[mcp_servers.cortex-hub]`ncommand = `"npx`"`nargs = [`"-y`", `"mcp-remote`", `"$McpUrl`", `"--header`", `"Authorization:Bearer $ApiKey`"]"
+                Add-Content -Path $codexConfig -Value $tomlBlock
                 Write-Ok "MCP: configured Codex"
             }
         }
@@ -301,24 +277,27 @@ if (-not (Test-Path ".cortex\project-profile.json") -or $Force) {
     }
 
     $stacksJson = ($DetectedStacks | ForEach-Object { "`"$_`"" }) -join ","
-    $profileJson = @"
-{
-  "schema_version": "2.0",
-  "project_name": "$(Split-Path $ProjectDir -Leaf)",
-  "fingerprint": {
-    "package_manager": "$PkgManager",
-    "stacks": [$stacksJson],
-    "detected_at": "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')"
-  },
-  "verify": {
-    "pre_commit": [$($PreCommitCmds -join ',')],
-    "full": [$($FullCmds -join ',')],
-    "auto_fix": true,
-    "max_retries": 2
-  }
-}
-"@
-    $profileJson | Out-File -FilePath ".cortex\project-profile.json" -Encoding utf8
+    $projectName = Split-Path $ProjectDir -Leaf
+    $detectedAt = Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ'
+    $preCommitJson = $PreCommitCmds -join ','
+    $fullJson = $FullCmds -join ','
+
+    $profile = @{
+        schema_version = "2.0"
+        project_name = $projectName
+        fingerprint = @{
+            package_manager = $PkgManager
+            stacks = $DetectedStacks
+            detected_at = $detectedAt
+        }
+        verify = @{
+            pre_commit = if ($PreCommitCmds.Count -gt 0) { $PreCommitCmds | ForEach-Object { $_.Trim('"') } } else { @() }
+            full = if ($FullCmds.Count -gt 0) { $FullCmds | ForEach-Object { $_.Trim('"') } } else { @() }
+            auto_fix = $true
+            max_retries = 2
+        }
+    }
+    $profile | ConvertTo-Json -Depth 4 | Out-File -FilePath ".cortex\project-profile.json" -Encoding utf8
     Write-Ok "Profile: .cortex\project-profile.json created ($($DetectedStacks -join ', '))"
 } else {
     Write-Ok "Profile: already exists"
@@ -616,12 +595,12 @@ fi
     }
 
     # ── Instruction files for other IDEs ──
-    $instructionContent = @"
+    $instructionContent = @'
 <!-- cortex-hub:auto-mcp -->
 ## Cortex Hub - Auto MCP (MANDATORY)
 
 At the START of every conversation:
-1. Call ``cortex_session_start`` with repo: "$GitRepo", agentId: "__AGENT_ID__", mode: "development"
+1. Call ``cortex_session_start`` with repo, agentId, mode: "development"
 2. If ``recentChanges.count > 0``, warn user and run ``git pull``
 3. Read ``STATE.md`` if it exists
 
@@ -634,7 +613,7 @@ At the START of every conversation:
 Run verify commands from ``.cortex/project-profile.json``, then ``cortex_quality_report``.
 End session: ``cortex_session_end`` with sessionId and summary.
 <!-- cortex-hub:auto-mcp -->
-"@
+'@
 
     if (Test-IDESelected "cursor") {
         ($instructionContent -replace "__AGENT_ID__", "cursor") | Out-File -FilePath ".cursorrules" -Encoding utf8
@@ -673,24 +652,24 @@ if (-not (Test-Path "lefthook.yml")) {
 # Phase 6: CLAUDE.md Injection
 # ══════════════════════════════════════════════
 $cortexMarker = "<!-- cortex-hub:auto-mcp -->"
-$claudeMdContent = @"
-$cortexMarker
+$claudeMdBody = @'
 ## Cortex Hub — MANDATORY (enforced by hooks)
 
 **YOUR FIRST ACTION in every conversation MUST be calling ``cortex_session_start``.**
 If you skip this, all Edit/Write/file-modifying Bash commands will return exit code 2 (BLOCKED).
 
-``cortex_session_start(repo: "$GitRepo", mode: "development", agentId: "claude-code")``
+``cortex_session_start(repo: "__REPO__", mode: "development", agentId: "claude-code")``
 
 Then:
-- If ``recentChanges.count > 0`` → warn user and ``git pull``
+- If ``recentChanges.count > 0`` - warn user and ``git pull``
 - Read ``STATE.md`` if it exists
 
-### Quality gates (enforced — commit blocked without these)
+### Quality gates (enforced - commit blocked without these)
 Run verify commands from ``.cortex/project-profile.json``.
 Call ``cortex_quality_report`` then ``cortex_session_end``.
-$cortexMarker
-"@
+'@
+$claudeMdBody = $claudeMdBody -replace "__REPO__", $GitRepo
+$claudeMdContent = "$cortexMarker`n$claudeMdBody`n$cortexMarker"
 
 if (-not (Test-Path "CLAUDE.md")) {
     $claudeMdContent | Out-File -FilePath "CLAUDE.md" -Encoding utf8
