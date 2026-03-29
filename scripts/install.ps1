@@ -256,14 +256,14 @@ if (-not (Test-Path ".cortex\project-profile.json") -or $Force) {
     # .NET (subdirectory)
     elseif (Get-ChildItem -Recurse -Depth 2 -Filter "*.sln" -ErrorAction SilentlyContinue) {
         $slnFile = (Get-ChildItem -Recurse -Depth 2 -Filter "*.sln" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-        $slnRelative = [System.IO.Path]::GetRelativePath($ProjectDir, $slnFile)
+        $slnRelative = $slnFile.Substring($ProjectDir.Length + 1) -replace '\\', '/'
         $DetectedStacks += "dotnet:$slnRelative"
         if ($PkgManager -eq "unknown") { $PkgManager = "dotnet-mixed" }
     }
     # Godot
     $godotFile = Get-ChildItem -Recurse -Depth 3 -Filter "project.godot" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($godotFile) {
-        $godotDir = [System.IO.Path]::GetRelativePath($ProjectDir, $godotFile.DirectoryName)
+        $godotDir = $godotFile.DirectoryName.Substring($ProjectDir.Length + 1) -replace '\\', '/'
         $DetectedStacks += "godot:$godotDir"
     }
     # Python scripts (no manifest)
