@@ -813,7 +813,7 @@ export interface ConductorTask {
   created_by_agent: string | null
   assigned_to_agent: string | null
   assigned_session_id: string | null
-  status: 'pending' | 'assigned' | 'accepted' | 'in_progress' | 'review' | 'completed' | 'failed' | 'cancelled'
+  status: string
   priority: number
   required_capabilities: string
   depends_on: string
@@ -879,3 +879,41 @@ export async function getTaskLogs(id: string) {
   return apiFetch<{ logs: ConductorTaskLog[] }>(`/api/tasks/${id}/logs`)
 }
 
+
+// ── Conductor Types ──
+export interface ConductorAgent {
+  agentId: string
+  queryCount: number
+  lastActivity: string
+  toolsUsed: string[]
+  sessionCount: number
+  projects: string[]
+  status: 'online' | 'idle' | 'offline'
+}
+
+export interface ConductorTask {
+  id: string
+  from_agent: string
+  to_agent: string | null
+  project: string
+  task_summary: string
+  context: string
+  priority: number
+  status: string
+  claimed_by: string | null
+  created_at: string
+  expires_at: string | null
+  agent_active: number
+}
+
+export async function getConductorAgents() {
+  return apiFetch<{ agents: ConductorAgent[] }>('/api/metrics/conductor/agents')
+}
+
+export async function getConductorTasks(limit = 50, owner?: string) {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (owner) params.set('owner', owner)
+  return apiFetch<{ tasks: ConductorTask[]; grouped: Record<string, ConductorTask[]> }>(
+    `/api/metrics/conductor/tasks?${params.toString()}`
+  )
+}

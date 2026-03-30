@@ -1,29 +1,28 @@
 'use client'
 
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo } from 'react'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import {
-  getTasks,
-  getTaskBoard,
-  getTaskLogs,
-  createTask,
-  getSessions,
+  getConductorAgents,
+  getConductorTasks,
+  type ConductorAgent,
   type ConductorTask,
-  type SessionHandoff,
 } from '@/lib/api'
 import styles from './page.module.css'
 
-// ── Helpers ──
+// ── Types ──
+type TaskFilter = 'all' | 'pending' | 'in_progress' | 'completed'
 
-function TimeAgo({ date }: { date: string }) {
+// ── Helpers ──
+function timeAgo(dateStr: string): string {
   const now = new Date()
-  const past = new Date(date)
+  const past = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z')
   const diff = Math.floor((now.getTime() - past.getTime()) / 1000)
-  if (diff < 60) return <span>{diff}s ago</span>
-  if (diff < 3600) return <span>{Math.floor(diff / 60)}m ago</span>
-  if (diff < 86400) return <span>{Math.floor(diff / 3600)}h ago</span>
-  return <span>{Math.floor(diff / 86400)}d ago</span>
+  if (diff < 60) return `${diff}s ago`
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
+  return `${Math.floor(diff / 86400)}d ago`
 }
 
 function PriorityBadge({ priority }: { priority: number }) {
@@ -31,247 +30,79 @@ function PriorityBadge({ priority }: { priority: number }) {
   const variant = priority <= 3 ? 'error' : priority <= 6 ? 'warning' : 'healthy'
   return (
     <span className={`badge badge-${variant}`}>
-      {label}
+      {label} ({priority})
     </span>
   )
 }
 
-function TaskStatusBadge({ status }: { status: string }) {
+function StatusBadge({ status }: { status: string }) {
   const variant =
-    status === 'completed' ? 'healthy'
-      : status === 'failed' || status === 'cancelled' ? 'error'
-        : status === 'in_progress' || status === 'accepted' ? 'warning'
-          : 'warning'
-  const labels: Record<string, string> = {
-    pending: '⏳ Pending',
-    assigned: '📋 Assigned',
-    accepted: '✋ Accepted',
-    in_progress: '🔄 Active',
-    review: '👀 Review',
-    completed: '✅ Done',
-    failed: '❌ Failed',
-    cancelled: '⛔ Cancelled',
-  }
-  return <span className={`badge badge-${variant}`}>{labels[status] ?? status}</span>
-}
-
-function OsBadge({ os }: { os: string }) {
-  const icon =
-    os?.toLowerCase().includes('darwin') || os?.toLowerCase().includes('mac') ? '🍎'
-      : os?.toLowerCase().includes('win') ? '🪟'
-        : os?.toLowerCase().includes('linux') ? '🐧'
-          : '💻'
-  return <span className={styles.osBadge}>{icon}</span>
-}
-
-// ── Derive agent from sessions ──
-interface AgentInfo {
-  name: string
-  os: string
-  isOnline: boolean
-  currentTask: string | null
-  sessionCount: number
-}
-
-function deriveAgents(sessions: SessionHandoff[]): AgentInfo[] {
-  const agentMap = new Map<string, AgentInfo>()
-  for (const s of sessions) {
-    const name = s.api_key_name || s.from_agent
-    if (!name) continue
-    const existing = agentMap.get(name)
-    if (existing) {
-      existing.sessionCount++
-      if (s.status === 'claimed' || s.status === 'pending') {
-        existing.isOnline = true
-        existing.currentTask = s.task_summary
-      }
-    } else {
-      agentMap.set(name, {
-        name,
-        os: '',
-        isOnline: s.status === 'claimed' || s.status === 'pending',
-        currentTask: (s.status === 'claimed' || s.status === 'pending') ? s.task_summary : null,
-        sessionCount: 1,
-      })
-    }
-  }
-  return Array.from(agentMap.values())
+    status === 'completed'
+      ? 'healthy'
+      : status === 'in_progress'
+        ? 'warning'
+        : status === 'pending'
+          ? 'warning'
+          : 'error'
+  return <span className={`badge badge-${variant}`}>{status}</span>
 }
 
 // ── Agent Card ──
+function AgentCard({ agent }: { agent: ConductorAgent }) {
+  const dotClass =
+    agent.status === 'online'
+      ? styles.statusDotOnline
+      : agent.status === 'idle'
+        ? styles.statusDotIdle
+        : styles.statusDotOffline
 
-function AgentCard({
-  agent,
-  isSelected,
-  onSelect,
-}: {
-  agent: AgentInfo
-  isSelected: boolean
-  onSelect: () => void
-}) {
+  const statusLabel =
+    agent.status === 'online'
+      ? 'Online'
+      : agent.status === 'idle'
+        ? 'Idle'
+        : 'Offline'
+
+  // Show up to 5 tools
+  const displayTools = agent.toolsUsed.slice(0, 5)
+  const extraTools = agent.toolsUsed.length - 5
+
   return (
-    <div
-      className={`${styles.agentCard} ${isSelected ? styles.agentCardSelected : ''}`}
-      onClick={onSelect}
-    >
+    <div className={`card ${styles.agentCard}`}>
       <div className={styles.agentHeader}>
-        <span className={`status-dot ${agent.isOnline ? 'healthy' : 'error'}`} />
-        <code className={styles.agentName}>{agent.name}</code>
-        {agent.os && <OsBadge os={agent.os} />}
+        <span className={`${styles.statusDot} ${dotClass}`} />
+        <span className={styles.agentName}>{agent.agentId}</span>
+        <span className={styles.agentStatus}>{statusLabel}</span>
       </div>
-      {agent.currentTask && (
-        <p className={styles.agentTask}>{agent.currentTask}</p>
-      )}
+
       <div className={styles.agentMeta}>
-        <span className={styles.agentMetaItem}>
-          {agent.sessionCount} session{agent.sessionCount !== 1 ? 's' : ''}
-        </span>
+        <div className={styles.agentMetaRow}>
+          {agent.queryCount} queries &middot; {agent.sessionCount} sessions
+        </div>
+        <div className={styles.agentMetaRow}>
+          Last seen: <code>{timeAgo(agent.lastActivity)}</code>
+        </div>
       </div>
-    </div>
-  )
-}
 
-// ── Task Card ──
-
-function TaskCard({
-  task,
-  isSelected,
-  onSelect,
-}: {
-  task: ConductorTask
-  isSelected: boolean
-  onSelect: () => void
-}) {
-  return (
-    <div
-      className={`${styles.taskCard} ${isSelected ? styles.taskCardSelected : ''}`}
-      onClick={onSelect}
-    >
-      <div className={styles.taskCardHeader}>
-        <span className={styles.taskTitle}>{task.title}</span>
-        <PriorityBadge priority={task.priority} />
-      </div>
-      {task.assigned_to_agent && (
-        <div className={styles.taskAssignee}>
-          <span className="status-dot healthy" />
-          <code>{task.assigned_to_agent}</code>
+      {agent.projects.length > 0 && (
+        <div className={styles.agentProjects}>
+          {agent.projects.map((p) => (
+            <span key={p} className={styles.projectTag}>
+              {p}
+            </span>
+          ))}
         </div>
       )}
-      <div className={styles.taskCardFooter}>
-        <TaskStatusBadge status={task.status} />
-        {task.created_at && (
-          <span className={styles.taskTime}>
-            <TimeAgo date={task.created_at} />
-          </span>
-        )}
-      </div>
-    </div>
-  )
-}
 
-// ── Task Detail Panel ──
-
-function TaskDetail({
-  task,
-  onClose,
-}: {
-  task: ConductorTask
-  onClose: () => void
-}) {
-  const { data: logsData } = useSWR(
-    `task-logs-${task.id}`,
-    () => getTaskLogs(task.id),
-    { refreshInterval: 5000 }
-  )
-  const logs = logsData?.logs ?? []
-
-  return (
-    <div className={styles.detailPanel}>
-      <div className={styles.detailHeader}>
-        <h3 className={styles.detailTitle}>Task Detail</h3>
-        <button className={styles.detailClose} onClick={onClose}>×</button>
-      </div>
-
-      <div className={styles.detailBody}>
-        {/* Info rows */}
-        <div className={styles.detailRow}>
-          <span className={styles.detailLabel}>Title</span>
-          <span className={styles.detailValue}>{task.title}</span>
-        </div>
-        <div className={styles.detailRow}>
-          <span className={styles.detailLabel}>Status</span>
-          <TaskStatusBadge status={task.status} />
-        </div>
-        <div className={styles.detailRow}>
-          <span className={styles.detailLabel}>Priority</span>
-          <PriorityBadge priority={task.priority} />
-        </div>
-        <div className={styles.detailRow}>
-          <span className={styles.detailLabel}>Agent</span>
-          <code className={styles.detailValue}>{task.assigned_to_agent ?? 'Unassigned'}</code>
-        </div>
-        <div className={styles.detailRow}>
-          <span className={styles.detailLabel}>Created By</span>
-          <code className={styles.detailValue}>{task.created_by_agent ?? '—'}</code>
-        </div>
-        <div className={styles.detailRow}>
-          <span className={styles.detailLabel}>Created</span>
-          <span className={styles.detailValue}>
-            {task.created_at ? new Date(task.created_at).toLocaleString() : '—'}
-          </span>
-        </div>
-        {task.completed_at && (
-          <div className={styles.detailRow}>
-            <span className={styles.detailLabel}>Completed</span>
-            <span className={styles.detailValue}>
-              {new Date(task.completed_at).toLocaleString()}
+      <div className={styles.agentFooter}>
+        <div className={styles.toolsList}>
+          {displayTools.map((tool) => (
+            <span key={tool} className={styles.toolTag}>
+              {tool}
             </span>
-          </div>
-        )}
-
-        {/* Description */}
-        <div className={styles.detailSection}>
-          <h4 className={styles.detailSectionTitle}>Description</h4>
-          <p className={styles.detailText}>{task.description}</p>
-        </div>
-
-        {/* Result */}
-        {task.result && (
-          <div className={styles.detailSection}>
-            <h4 className={styles.detailSectionTitle}>Result</h4>
-            <pre className={styles.detailCode}>{task.result}</pre>
-          </div>
-        )}
-
-        {/* Context */}
-        {task.context && task.context !== '{}' && (
-          <div className={styles.detailSection}>
-            <h4 className={styles.detailSectionTitle}>Context</h4>
-            <pre className={styles.detailCode}>{task.context}</pre>
-          </div>
-        )}
-
-        {/* Activity Log */}
-        <div className={styles.detailSection}>
-          <h4 className={styles.detailSectionTitle}>Activity Log</h4>
-          {logs.length === 0 ? (
-            <p className={styles.detailTextMuted}>No activity yet.</p>
-          ) : (
-            <div className={styles.activityLog}>
-              {logs.map((log) => (
-                <div key={log.id} className={styles.logEntry}>
-                  <div className={styles.logDot} />
-                  <div className={styles.logContent}>
-                    <span className={styles.logAction}>{log.action}</span>
-                    {log.message && <span className={styles.logMessage}>{log.message}</span>}
-                    <span className={styles.logTime}>
-                      {log.agent_id && <code>{log.agent_id}</code>}
-                      {log.created_at && <> · <TimeAgo date={log.created_at} /></>}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
+          ))}
+          {extraTools > 0 && (
+            <span className={styles.toolTag}>+{extraTools}</span>
           )}
         </div>
       </div>
@@ -279,149 +110,48 @@ function TaskDetail({
   )
 }
 
-// ── Create Task Dialog ──
-
-function CreateTaskDialog({
-  agents,
-  onClose,
-  onCreated,
-}: {
-  agents: AgentInfo[]
-  onClose: () => void
-  onCreated: () => void
-}) {
-  const [title, setTitle] = useState('')
-  const [description, setDescription] = useState('')
-  const [assignTo, setAssignTo] = useState('')
-  const [priority, setPriority] = useState(5)
-  const [isSubmitting, setIsSubmitting] = useState(false)
-
-  const handleSubmit = useCallback(async () => {
-    if (!title.trim() || !description.trim()) return
-    setIsSubmitting(true)
-    try {
-      await createTask({
-        title: title.trim(),
-        description: description.trim(),
-        assignTo: assignTo || undefined,
-        priority,
-      })
-      onCreated()
-      onClose()
-    } catch {
-      // error handled by ApiError
-    } finally {
-      setIsSubmitting(false)
-    }
-  }, [title, description, assignTo, priority, onCreated, onClose])
-
+// ── Task Card ──
+function TaskCard({ task }: { task: ConductorTask }) {
   return (
-    <div className={styles.dialogOverlay} onClick={onClose}>
-      <div className={styles.dialogPanel} onClick={(e) => e.stopPropagation()}>
-        <div className={styles.dialogHeader}>
-          <h3 className={styles.dialogTitle}>New Task</h3>
-          <button className={styles.detailClose} onClick={onClose}>×</button>
+    <div className={`card ${styles.taskCard}`}>
+      <div className={styles.taskHeader}>
+        <code className={styles.taskId}>{task.id.slice(0, 12)}</code>
+        <StatusBadge status={task.status} />
+      </div>
+
+      <p className={styles.taskSummary}>{task.task_summary}</p>
+
+      <div className={styles.taskMeta}>
+        <div className={styles.taskMetaItem}>
+          <span className={styles.taskMetaLabel}>Project</span>
+          <span className={styles.taskMetaValue}>{task.project}</span>
         </div>
-
-        <div className={styles.dialogBody}>
-          <div className={styles.formGroup}>
-            <label className={styles.formLabel}>Title</label>
-            <input
-              className="input"
-              placeholder="Task title"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              autoFocus
-            />
-          </div>
-
-          <div className={styles.formGroup}>
-            <label className={styles.formLabel}>Description</label>
-            <textarea
-              className={`input ${styles.textarea}`}
-              placeholder="What should be done?"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              rows={4}
-            />
-          </div>
-
-          <div className={styles.formRow}>
-            <div className={styles.formGroup}>
-              <label className={styles.formLabel}>Assign to</label>
-              <select
-                className="input"
-                value={assignTo}
-                onChange={(e) => setAssignTo(e.target.value)}
-              >
-                <option value="">Unassigned</option>
-                {agents.map((a) => (
-                  <option key={a.name} value={a.name}>{a.name}</option>
-                ))}
-              </select>
-            </div>
-
-            <div className={styles.formGroup}>
-              <label className={styles.formLabel}>Priority (1-10)</label>
-              <input
-                className="input"
-                type="number"
-                min={1}
-                max={10}
-                value={priority}
-                onChange={(e) => setPriority(Number(e.target.value))}
-              />
-            </div>
-          </div>
+        <div className={styles.taskMetaItem}>
+          <span className={styles.taskMetaLabel}>From</span>
+          <span className={styles.taskMetaValue}>
+            <code>{task.from_agent}</code>
+          </span>
         </div>
-
-        <div className={styles.dialogFooter}>
-          <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
-          <button
-            className="btn btn-primary"
-            onClick={handleSubmit}
-            disabled={isSubmitting || !title.trim() || !description.trim()}
-          >
-            {isSubmitting ? 'Creating…' : 'Create Task'}
-          </button>
+        <div className={styles.taskMetaItem}>
+          <span className={styles.taskMetaLabel}>To</span>
+          <span className={styles.taskMetaValue}>
+            <code>{task.to_agent ?? '--'}</code>
+          </span>
+        </div>
+        <div className={styles.taskMetaItem}>
+          <span className={styles.taskMetaLabel}>Priority</span>
+          <PriorityBadge priority={task.priority} />
         </div>
       </div>
-    </div>
-  )
-}
 
-// ── Kanban Column ──
-
-function KanbanColumn({
-  title,
-  icon,
-  tasks,
-  selectedTaskId,
-  onSelectTask,
-}: {
-  title: string
-  icon: string
-  tasks: ConductorTask[]
-  selectedTaskId: string | null
-  onSelectTask: (task: ConductorTask) => void
-}) {
-  return (
-    <div className={styles.kanbanColumn}>
-      <div className={styles.kanbanColumnHeader}>
-        <span>{icon} {title}</span>
-        <span className={styles.kanbanCount}>{tasks.length}</span>
-      </div>
-      <div className={styles.kanbanColumnBody}>
-        {tasks.map((task) => (
-          <TaskCard
-            key={task.id}
-            task={task}
-            isSelected={task.id === selectedTaskId}
-            onSelect={() => onSelectTask(task)}
-          />
-        ))}
-        {tasks.length === 0 && (
-          <div className={styles.kanbanEmpty}>No tasks</div>
+      <div className={styles.taskFooter}>
+        <span className={styles.timestamp}>
+          {task.created_at ? timeAgo(task.created_at) : '--'}
+        </span>
+        {task.claimed_by && (
+          <span className={styles.claimedBy}>
+            Claimed by <code>{task.claimed_by}</code>
+          </span>
         )}
       </div>
     </div>
@@ -429,108 +159,82 @@ function KanbanColumn({
 }
 
 // ── Main Page ──
-
 export default function ConductorPage() {
-  // Data fetching
-  const { data: boardData, mutate: mutateBoard } = useSWR(
-    'conductor-board',
-    getTaskBoard,
-    { refreshInterval: 5000 }
-  )
-  const { data: allTasksData, mutate: mutateTasks } = useSWR(
-    'conductor-tasks',
-    () => getTasks(),
-    { refreshInterval: 5000 }
-  )
-  const { data: sessionsData } = useSWR(
-    'conductor-sessions',
-    () => getSessions(100),
-    { refreshInterval: 10000 }
-  )
+  const {
+    data: agentData,
+    error: agentError,
+    isLoading: agentLoading,
+    mutate: mutateAgents,
+  } = useSWR('conductor-agents', () => getConductorAgents(), {
+    refreshInterval: 5000,
+  })
 
-  // State
-  const [selectedTask, setSelectedTask] = useState<ConductorTask | null>(null)
-  const [selectedAgent, setSelectedAgent] = useState<string | null>(null)
-  const [showCreateDialog, setShowCreateDialog] = useState(false)
+  const {
+    data: taskData,
+    error: taskError,
+    isLoading: taskLoading,
+    mutate: mutateTasks,
+  } = useSWR('conductor-tasks', () => getConductorTasks(100), {
+    refreshInterval: 5000,
+  })
 
-  // Derived
-  const agents = useMemo(
-    () => deriveAgents(sessionsData?.sessions ?? []),
-    [sessionsData]
-  )
+  const [taskFilter, setTaskFilter] = useState<TaskFilter>('all')
 
-  const allTasks = allTasksData?.tasks ?? []
+  const agents = agentData?.agents ?? []
+  const allTasks = taskData?.tasks ?? []
+  const grouped = taskData?.grouped ?? {}
 
-  // Kanban columns — use board endpoint if available, else derive from allTasks
-  const columns = useMemo(() => {
-    if (boardData?.columns) {
-      return boardData.columns
-    }
-    // Fallback: group allTasks by status
-    const pending: ConductorTask[] = []
-    const inProgress: ConductorTask[] = []
-    const completed: ConductorTask[] = []
-    for (const t of allTasks) {
-      if (t.status === 'completed') completed.push(t)
-      else if (t.status === 'in_progress' || t.status === 'accepted' || t.status === 'assigned') inProgress.push(t)
-      else if (t.status === 'failed' || t.status === 'cancelled') completed.push(t)
-      else pending.push(t)
-    }
-    return { pending, in_progress: inProgress, completed }
-  }, [boardData, allTasks])
+  const onlineCount = agents.filter((a) => a.status === 'online').length
+  const idleCount = agents.filter((a) => a.status === 'idle').length
 
-  // Filter tasks by selected agent
-  const filteredColumns = useMemo(() => {
-    if (!selectedAgent) return columns
-    const filtered: Record<string, ConductorTask[]> = {}
-    for (const [key, tasks] of Object.entries(columns)) {
-      filtered[key] = tasks.filter(
-        (t) => t.assigned_to_agent === selectedAgent || t.created_by_agent === selectedAgent
-      )
-    }
-    return filtered
-  }, [columns, selectedAgent])
+  const filteredTasks = useMemo(() => {
+    if (taskFilter === 'all') return allTasks
+    return allTasks.filter((t) => t.status === taskFilter)
+  }, [allTasks, taskFilter])
 
-  // Stats
-  const totalTasks = allTasks.length
   const pendingCount = allTasks.filter((t) => t.status === 'pending').length
-  const activeCount = allTasks.filter((t) =>
-    ['assigned', 'accepted', 'in_progress', 'review'].includes(t.status)
-  ).length
+  const claimedCount = allTasks.filter((t) => t.status === 'in_progress').length
   const completedCount = allTasks.filter((t) => t.status === 'completed').length
 
-  const handleRefresh = useCallback(() => {
-    mutateBoard()
-    mutateTasks()
-  }, [mutateBoard, mutateTasks])
+  const taskFilterTabs: { key: TaskFilter; label: string; count: number }[] = [
+    { key: 'all', label: 'All', count: allTasks.length },
+    { key: 'pending', label: 'Pending', count: pendingCount },
+    { key: 'in_progress', label: 'In Progress', count: claimedCount },
+    { key: 'completed', label: 'Completed', count: completedCount },
+  ]
+
+  const isLoading = agentLoading || taskLoading
 
   return (
-    <DashboardLayout title="Conductor" subtitle="Multi-agent task orchestration board">
-      {/* Stats bar */}
+    <DashboardLayout
+      title="Conductor"
+      subtitle="Live agent orchestration and task management"
+    >
+      {/* Stats */}
       <div className={styles.statsGrid}>
         <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>🎯</span>
+          <span className={styles.statIcon}>&#9679;</span>
           <div>
-            <div className={styles.statValue}>{totalTasks}</div>
-            <div className={styles.statLabel}>Total Tasks</div>
+            <div className={styles.statValue}>{onlineCount}</div>
+            <div className={styles.statLabel}>Online Agents</div>
           </div>
         </div>
         <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>⏳</span>
+          <span className={styles.statIcon}>&#9676;</span>
+          <div>
+            <div className={styles.statValue}>{idleCount}</div>
+            <div className={styles.statLabel}>Idle Agents</div>
+          </div>
+        </div>
+        <div className={`card ${styles.statCard}`}>
+          <span className={styles.statIcon}>&#9744;</span>
           <div>
             <div className={styles.statValue}>{pendingCount}</div>
-            <div className={styles.statLabel}>Pending</div>
+            <div className={styles.statLabel}>Pending Tasks</div>
           </div>
         </div>
         <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>🔄</span>
-          <div>
-            <div className={styles.statValue}>{activeCount}</div>
-            <div className={styles.statLabel}>Active</div>
-          </div>
-        </div>
-        <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>✅</span>
+          <span className={styles.statIcon}>&#9745;</span>
           <div>
             <div className={styles.statValue}>{completedCount}</div>
             <div className={styles.statLabel}>Completed</div>
@@ -538,121 +242,120 @@ export default function ConductorPage() {
         </div>
       </div>
 
-      {/* 3-panel layout */}
-      <div className={styles.conductorGrid}>
-        {/* Left: Agents */}
-        <div className={styles.agentPanel}>
-          <div className={styles.panelHeader}>
-            <h2 className={styles.panelTitle}>Active Agents</h2>
-            <span className={styles.panelCount}>{agents.length}</span>
-          </div>
-          <div className={styles.agentList}>
-            {agents.length === 0 ? (
-              <div className={styles.emptyPanel}>
-                <span className={styles.emptyIcon}>🤖</span>
-                <p>No agents online</p>
-                <p className={styles.emptyHint}>
-                  Agents appear when they start sessions via MCP.
-                </p>
-              </div>
-            ) : (
-              <>
-                {selectedAgent && (
-                  <button
-                    className={styles.clearFilter}
-                    onClick={() => setSelectedAgent(null)}
-                  >
-                    ✕ Clear filter
-                  </button>
-                )}
-                {agents.map((agent) => (
-                  <AgentCard
-                    key={agent.name}
-                    agent={agent}
-                    isSelected={agent.name === selectedAgent}
-                    onSelect={() =>
-                      setSelectedAgent(agent.name === selectedAgent ? null : agent.name)
-                    }
-                  />
-                ))}
-              </>
-            )}
-          </div>
+      {/* Active Agents */}
+      <div className={styles.section}>
+        <div className={styles.sectionHeader}>
+          <h2 className={styles.sectionTitle}>Active Agents</h2>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => mutateAgents()}
+            disabled={isLoading}
+          >
+            {agentLoading ? 'Loading...' : 'Refresh'}
+          </button>
         </div>
 
-        {/* Center: Kanban */}
-        <div className={styles.boardPanel}>
-          <div className={styles.panelHeader}>
-            <h2 className={styles.panelTitle}>
-              Task Board
-              {selectedAgent && (
-                <span className={styles.filterLabel}> — {selectedAgent}</span>
-              )}
-            </h2>
-            <div className={styles.boardActions}>
-              <button className="btn btn-secondary btn-sm" onClick={handleRefresh}>
-                Refresh
-              </button>
-              <button
-                className="btn btn-primary btn-sm"
-                onClick={() => setShowCreateDialog(true)}
-              >
-                + New Task
-              </button>
-            </div>
-          </div>
-          <div className={styles.kanbanBoard}>
-            <KanbanColumn
-              title="Pending"
-              icon="⏳"
-              tasks={filteredColumns.pending ?? []}
-              selectedTaskId={selectedTask?.id ?? null}
-              onSelectTask={setSelectedTask}
-            />
-            <KanbanColumn
-              title="Active"
-              icon="🔄"
-              tasks={filteredColumns['in_progress'] ?? []}
-              selectedTaskId={selectedTask?.id ?? null}
-              onSelectTask={setSelectedTask}
-            />
-            <KanbanColumn
-              title="Done"
-              icon="✅"
-              tasks={filteredColumns['completed'] ?? []}
-              selectedTaskId={selectedTask?.id ?? null}
-              onSelectTask={setSelectedTask}
-            />
-          </div>
-        </div>
+        {agentError && (
+          <div className={styles.errorBanner}>Failed to load agents</div>
+        )}
 
-        {/* Right: Detail */}
-        <div className={styles.detailPanelContainer}>
-          {selectedTask ? (
-            <TaskDetail
-              task={selectedTask}
-              onClose={() => setSelectedTask(null)}
-            />
-          ) : (
-            <div className={styles.emptyPanel}>
-              <span className={styles.emptyIcon}>📋</span>
-              <p>Select a task</p>
-              <p className={styles.emptyHint}>
-                Click any task card to view details and activity log.
-              </p>
-            </div>
-          )}
-        </div>
+        {agents.length === 0 && !agentLoading ? (
+          <div className={`card ${styles.emptyState}`}>
+            <span className={styles.emptyIcon}>&#9683;</span>
+            <p>No active agents in the last 30 minutes.</p>
+            <p className={styles.emptyHint}>
+              Agents appear when they make API calls via{' '}
+              <code>cortex_session_start</code> or other MCP tools.
+            </p>
+          </div>
+        ) : (
+          <div className={styles.agentsGrid}>
+            {agents.map((agent) => (
+              <AgentCard key={agent.agentId} agent={agent} />
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Create Dialog */}
-      {showCreateDialog && (
-        <CreateTaskDialog
-          agents={agents}
-          onClose={() => setShowCreateDialog(false)}
-          onCreated={handleRefresh}
-        />
-      )}
+      {/* Tasks */}
+      <div className={styles.section}>
+        <div className={styles.sectionHeader}>
+          <h2 className={styles.sectionTitle}>Task Board</h2>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => mutateTasks()}
+            disabled={isLoading}
+          >
+            {taskLoading ? 'Loading...' : 'Refresh'}
+          </button>
+        </div>
+
+        {/* Filter tabs */}
+        <div className={styles.filterTabs}>
+          {taskFilterTabs.map((tab) => (
+            <button
+              key={tab.key}
+              className={`${styles.filterTab} ${taskFilter === tab.key ? styles.filterTabActive : ''}`}
+              onClick={() => setTaskFilter(tab.key)}
+            >
+              {tab.label}
+              <span className={styles.filterCount}>{tab.count}</span>
+            </button>
+          ))}
+        </div>
+
+        {taskError && (
+          <div className={styles.errorBanner}>Failed to load tasks</div>
+        )}
+
+        {filteredTasks.length === 0 && !taskLoading ? (
+          <div className={`card ${styles.emptyState}`}>
+            <span className={styles.emptyIcon}>&#9776;</span>
+            <p>
+              {allTasks.length > 0
+                ? 'No tasks match the current filter.'
+                : 'No tasks yet.'}
+            </p>
+            <p className={styles.emptyHint}>
+              Tasks are created when agents start sessions via{' '}
+              <code>cortex.session.start</code>.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Grouped view */}
+            {Object.keys(grouped).length > 1 ? (
+              Object.entries(grouped).map(([agentId, agentTasks]) => {
+                const visibleTasks = agentTasks.filter(
+                  (t) => taskFilter === 'all' || t.status === taskFilter
+                )
+                if (visibleTasks.length === 0) return null
+                return (
+                  <div key={agentId} className={styles.taskGroup}>
+                    <div className={styles.taskGroupHeader}>
+                      <span className={styles.taskGroupName}>{agentId}</span>
+                      <span className={styles.taskGroupCount}>
+                        {visibleTasks.length} task{visibleTasks.length !== 1 ? 's' : ''}
+                      </span>
+                    </div>
+                    <div className={styles.tasksGrid}>
+                      {visibleTasks.map((task) => (
+                        <TaskCard key={task.id} task={task} />
+                      ))}
+                    </div>
+                  </div>
+                )
+              })
+            ) : (
+              <div className={styles.tasksGrid}>
+                {filteredTasks.map((task) => (
+                  <TaskCard key={task.id} task={task} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </DashboardLayout>
   )
 }
