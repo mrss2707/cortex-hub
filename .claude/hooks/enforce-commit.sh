@@ -1,5 +1,6 @@
 #!/bin/bash
-# Cortex Commit Enforcement (v3) — Blocks commit without quality gates
+# Cortex Commit Enforcement (v4.0) — Blocks commit without full workflow compliance
+# Checks: session started + discovery tools used + quality gates passed
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 STATE_DIR="$PROJECT_DIR/.cortex/.session-state"
@@ -15,8 +16,22 @@ fi
 [[ ! "$COMMAND" =~ ^git\ (commit|push) ]] && exit 0
 
 if [[ "$COMMAND" =~ ^git\ commit ]]; then
-  if [ ! -f "$STATE_DIR/quality-gates-passed" ]; then
-    echo "BLOCKED: Quality gates not passed. Run build/typecheck/lint first, then call cortex_quality_report." >&2
+  MISSING=""
+
+  # Check 1: session started
+  [ ! -f "$STATE_DIR/session-started" ] && MISSING="${MISSING}\n  - cortex_session_start (not called)"
+
+  # Check 2: discovery tools used
+  [ ! -f "$STATE_DIR/discovery-used" ] && MISSING="${MISSING}\n  - cortex_code_search or cortex_knowledge_search (0 calls — must search before editing)"
+
+  # Check 3: quality gates passed
+  [ ! -f "$STATE_DIR/quality-gates-passed" ] && MISSING="${MISSING}\n  - Quality gates: run build/typecheck/lint then call cortex_quality_report"
+
+  if [ -n "$MISSING" ]; then
+    echo "BLOCKED: Cannot commit — missing Cortex workflow steps:${MISSING}" >&2
+    echo "" >&2
+    echo "Fix these steps, then try committing again." >&2
+    echo "Read CLAUDE.md 'Tool Priority' section for the required workflow." >&2
     exit 2
   fi
 fi
