@@ -1,4 +1,3 @@
-// @ts-expect-error ws module
 import { WebSocketServer, WebSocket } from 'ws'
 import type { IncomingMessage } from 'http'
 import type { Server } from 'http'

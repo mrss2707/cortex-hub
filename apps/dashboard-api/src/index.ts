@@ -1,5 +1,4 @@
 import { serve } from '@hono/node-server'
-import { setupConductorWebSocket } from './ws/conductor.js'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { Hono } from 'hono'
 import { readFileSync } from 'node:fs'
@@ -122,5 +121,10 @@ const server = serve({ fetch: app.fetch, port }, () => {
 })
 
 // WebSocket for Conductor real-time agent communication
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-setupConductorWebSocket(server as any)
+try {
+  const { setupConductorWebSocket } = await import('./ws/conductor.js')
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  setupConductorWebSocket(server as any)
+} catch (e) {
+  console.warn('[ws] Conductor WebSocket not available:', (e as Error).message)
+}
