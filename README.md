@@ -501,7 +501,58 @@ cortex-hub/
 - ✅ GitHub Actions: Docker build → GHCR publish with auto version bump
 - ✅ Watchtower auto-update: server pulls new images automatically
 
-### Planned
+### Planned — Cortex Conductor (Multi-Agent Orchestration)
+
+**Agent-to-agent task collaboration across machines and IDEs.**
+
+```
+Agent A (macOS)                   Agent B (Win VPS)              Agent C (Antigravity)
+═══════════════                   ═══════════════                ═══════════════
+Build Godot scene ████░░          idle                           idle
+
+STUCK: need textures
+ ↓ create task → Agent B          Accept: extract textures       Accept: design UI
+ ↓ create task → Agent C           ████████░░ extracting...       ████░░ wireframe
+
+Switch to physics code ←          Upload R2 ✓                    UI mockup done
+(not blocked)                      → notify Agent A               → notify Agent A
+
+Physics done ██████████           idle                           idle
+
+← Receive textures from B
+← Receive UI design from C
+
+Apply textures + build UI
+████████████ Scene complete ✓
+ → Send to Codex for review
+```
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Agent Identity** | ✅ Shipped | Auto-detect OS, tools, hostname. `.cortex/agent-identity.json` for role/capabilities |
+| **Conductor Design** | ✅ Spec'd | Full architecture doc at `docs/architecture/conductor-design.md` |
+| Agent-to-agent tasks | 🔄 Next | `cortex_task_create` — agents delegate work to other agents |
+| Task pickup & notify | 🔄 Next | Hint injection pushes tasks into MCP responses |
+| Dashboard /conductor | 🔄 Planned | Timeline view, Kanban board, agent cards with capabilities |
+| Dependency chains | 🔄 Planned | Task B waits for Task A. Auto-unblock on completion |
+| Multi-IDE support | 🔄 Planned | Claude CLI, VS Code, Cursor, Antigravity, Codex — all participate |
+| Smart assignment | 📋 Future | Auto-suggest agent based on capabilities match |
+
+**Key innovation:** Agents don't just receive tasks from humans — they **create tasks for each other**. An agent building a Godot game can ask a Windows VPS agent to extract resources, ask Antigravity to design UI, and ask Codex to review code — all without human intervention.
+
+**Supported IDEs in Conductor:**
+
+| IDE | Task receive | Task create | Role examples |
+|-----|:---:|:---:|---|
+| Claude Code CLI | via MCP hints | via MCP tool | Backend, build, DevOps |
+| Claude Code VS Code | via MCP hints | via MCP tool | Full-stack, debug |
+| Cursor | via MCP hints | via MCP tool | Frontend, UI |
+| Antigravity (Gemini) | via MCP hints | via MCP tool | Design, prototyping |
+| OpenAI Codex | via polling | via exec | Code review, QA |
+
+> Design doc: [`docs/architecture/conductor-design.md`](docs/architecture/conductor-design.md)
+
+### Other Planned
 
 - [ ] Agent performance leaderboard
 - [ ] Plugin system for custom MCP tools
