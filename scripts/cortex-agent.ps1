@@ -1,536 +1,738 @@
-# Cortex Agent — Universal task executor with WebSocket connection (Windows PowerShell)
-# Works with any IDE: Claude, Codex, Antigravity, Cursor
-#
-# Usage:
-#   .\cortex-agent.ps1 start                          # Auto-detect IDE
-#   .\cortex-agent.ps1 start -Name "builder"          # Custom name
-#   .\cortex-agent.ps1 start -Engine claude            # Specify engine
-#   .\cortex-agent.ps1 start -Engine codex             # Use Codex
-#   .\cortex-agent.ps1 start -Url wss://hub.jackle.dev/ws/conductor
-#   .\cortex-agent.ps1 stop                            # Stop daemon
-#   .\cortex-agent.ps1 status                          # Show status
+# ============================================================
+# cortex-agent.ps1 -- Cortex Hub WebSocket Agent Client
+# Windows PowerShell equivalent of cortex-agent.sh.
+# Connects to Hub conductor via WebSocket using Node.js ws
+# package, receives task assignments, and spawns AI engines.
+# ============================================================
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("start", "stop", "status", "help")]
+    [ValidateSet("start", "stop", "status", "logs", "help")]
     [string]$Command = "help",
 
-    [string]$Name = "",
-    [string]$Engine = "",
-    [string]$Url = "",
-    [string]$ApiKey = "",
-    [int]$MaxTurns = 30,
-    [switch]$Foreground
+    [switch]$Daemon,
+
+    [Alias("d")]
+    [switch]$Background,
+
+    [int]$LogLines = 50
 )
 
 $ErrorActionPreference = "Stop"
 
-# ---------------------------------------------------------------------------
-# Constants & defaults
-# ---------------------------------------------------------------------------
+# -- Constants ------------------------------------------------
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Split-Path -Parent $ScriptDir
-$CortexDir = Join-Path $RepoRoot ".cortex"
-$PidFile = Join-Path $CortexDir "agent.pid"
-$LogFile = Join-Path $CortexDir "agent.log"
-$WsPidFile = Join-Path $CortexDir "agent-ws.pid"
-$MaxLogLines = 1000
-$ReconnectDelay = 5
-$MaxReconnectDelay = 60
+$ProjectRoot = Split-Path -Parent $ScriptDir
 
-# Resolve URL
-if (-not $Url) {
-    $Url = if ($env:CORTEX_WS_URL) { $env:CORTEX_WS_URL } else { "ws://cortex-api:4000/ws/conductor" }
+$DefaultHubUrl = "ws://localhost:4000/ws/conductor"
+$IdentityFile = Join-Path $ProjectRoot ".cortex" "agent-identity.json"
+$PidFile = if ($env:CORTEX_AGENT_PID_FILE) { $env:CORTEX_AGENT_PID_FILE } else { Join-Path $env:TEMP "cortex-agent.pid" }
+$LogDir = if ($env:CORTEX_AGENT_LOG_DIR) { $env:CORTEX_AGENT_LOG_DIR } else { Join-Path $env:TEMP "cortex-agent-logs" }
+$LogFile = Join-Path $LogDir "cortex-agent.log"
+$MaxLogSize = 10MB
+$MaxLogFiles = 5
+$DebugMode = $env:CORTEX_AGENT_DEBUG -eq "1"
+
+# -- Logging --------------------------------------------------
+function Write-AgentLog {
+    param(
+        [string]$Level,
+        [string]$Message
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] [$Level] $Message"
+
+    # Append to log file
+    try {
+        if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+        Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
+    }
+    catch { }
+
+    # Console output with color
+    switch ($Level) {
+        "ERROR" { Write-Host $line -ForegroundColor Red }
+        "WARN"  { Write-Host $line -ForegroundColor Yellow }
+        "INFO"  { Write-Host $line -ForegroundColor Green }
+        "DEBUG" { if ($DebugMode) { Write-Host $line -ForegroundColor Cyan } }
+    }
 }
 
-# Resolve API key
-if (-not $ApiKey) {
-    $ApiKey = $env:HUB_API_KEY
-}
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-function Write-Log {
-    param([string]$Message)
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[$ts] $Message"
-    Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
-}
-
-function Write-Info {
-    param([string]$Message)
-    Write-Host "[cortex-agent] $Message" -ForegroundColor Blue
-    Write-Log "INFO  $Message"
-}
-
-function Write-Ok {
-    param([string]$Message)
-    Write-Host "[cortex-agent] $Message" -ForegroundColor Green
-    Write-Log "OK    $Message"
-}
-
-function Write-Warn {
-    param([string]$Message)
-    Write-Host "[cortex-agent] $Message" -ForegroundColor Yellow
-    Write-Log "WARN  $Message"
-}
-
-function Write-Err {
-    param([string]$Message)
-    Write-Host "[cortex-agent] $Message" -ForegroundColor Red
-    Write-Log "ERROR $Message"
-}
-
+# -- Log Rotation ---------------------------------------------
 function Invoke-LogRotation {
     if (Test-Path $LogFile) {
-        $lines = (Get-Content $LogFile).Count
-        if ($lines -gt $MaxLogLines) {
-            $content = Get-Content $LogFile | Select-Object -Last $MaxLogLines
-            Set-Content -Path $LogFile -Value $content
+        $size = (Get-Item $LogFile).Length
+        if ($size -gt $MaxLogSize) {
+            for ($i = $MaxLogFiles; $i -gt 1; $i--) {
+                $prev = $i - 1
+                $src = "$LogFile.$prev"
+                $dst = "$LogFile.$i"
+                if (Test-Path $src) { Move-Item -Path $src -Destination $dst -Force }
+            }
+            Move-Item -Path $LogFile -Destination "$LogFile.1" -Force
+            Write-AgentLog "INFO" "Log rotated (exceeded $MaxLogSize bytes)"
         }
     }
 }
 
-function Initialize-CortexDir {
-    if (-not (Test-Path $CortexDir)) {
-        New-Item -ItemType Directory -Path $CortexDir -Force | Out-Null
+# -- Dependency Check -----------------------------------------
+function Test-Dependencies {
+    $missing = @()
+
+    if (-not (Get-Command "node" -ErrorAction SilentlyContinue)) {
+        $missing += "node"
+    }
+
+    # Check ws package availability
+    $wsCheck = & node -e "try{require('ws');process.exit(0)}catch{try{require('$($ProjectRoot -replace '\\','/')/node_modules/ws');process.exit(0)}catch{process.exit(1)}}" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $missing += "ws (npm package)"
+    }
+
+    if ($missing.Count -gt 0) {
+        Write-AgentLog "ERROR" "Missing dependencies: $($missing -join ', ')"
+        Write-AgentLog "ERROR" "Install with: npm install -g ws (or run pnpm install in project root)"
+        exit 1
     }
 }
 
-# ---------------------------------------------------------------------------
-# Engine detection
-# ---------------------------------------------------------------------------
+# -- Identity -------------------------------------------------
+$script:AgentId = ""
+$script:AgentHostname = ""
+$script:AgentOs = ""
+$script:AgentIde = ""
+$script:AgentRole = ""
+$script:AgentCapabilities = '["claude"]'
 
-function Get-Engine {
-    if ($Engine) {
-        if (-not (Get-Command $Engine -ErrorAction SilentlyContinue)) {
-            Write-Err "Specified engine '$Engine' not found in PATH"
-            exit 1
-        }
-        return $Engine
-    }
-
-    if (Get-Command "claude" -ErrorAction SilentlyContinue) { return "claude" }
-    if (Get-Command "codex" -ErrorAction SilentlyContinue) { return "codex" }
-    if (Get-Command "gemini" -ErrorAction SilentlyContinue) { return "gemini" }
-
-    Write-Err "No supported engine found. Install one of: claude, codex, gemini"
-    exit 1
-}
-
-# ---------------------------------------------------------------------------
-# Agent name resolution
-# ---------------------------------------------------------------------------
-
-function Get-AgentName {
-    if ($Name) { return $Name }
-
-    $identityFile = Join-Path $CortexDir "agent-identity.json"
-    if (Test-Path $identityFile) {
+function Read-AgentIdentity {
+    if (Test-Path $IdentityFile) {
         try {
-            $identity = Get-Content $identityFile | ConvertFrom-Json
-            if ($identity.hostname) { return $identity.hostname }
-            if ($identity.name) { return $identity.name }
-        } catch {}
+            $identity = Get-Content $IdentityFile -Raw | ConvertFrom-Json
+            $script:AgentId = if ($identity.agentId) { $identity.agentId } elseif ($identity.id) { $identity.id } else { "unknown" }
+            $script:AgentHostname = if ($identity.hostname) { $identity.hostname } else { $env:COMPUTERNAME }
+            $script:AgentOs = if ($identity.os) { $identity.os } else { "Windows" }
+            $script:AgentIde = if ($identity.ide) { $identity.ide } else { "cli" }
+            $script:AgentRole = if ($identity.role) { $identity.role } else { "worker" }
+            if ($identity.capabilities) {
+                $script:AgentCapabilities = ($identity.capabilities | ConvertTo-Json -Compress)
+            }
+            Write-AgentLog "INFO" "Loaded identity from $IdentityFile (agentId=$($script:AgentId))"
+        }
+        catch {
+            Write-AgentLog "WARN" "Failed to parse identity file: $_"
+            Set-DefaultIdentity
+        }
     }
-
-    $hostname = $env:COMPUTERNAME
-    $eng = Get-Engine
-    return "$hostname-$eng"
+    else {
+        Set-DefaultIdentity
+    }
 }
 
-# ---------------------------------------------------------------------------
-# WebSocket client Node.js script
-# ---------------------------------------------------------------------------
+function Set-DefaultIdentity {
+    $script:AgentId = if ($env:CORTEX_AGENT_ID) { $env:CORTEX_AGENT_ID } else { "cortex-agent-$env:COMPUTERNAME" }
+    $script:AgentHostname = $env:COMPUTERNAME
+    $script:AgentOs = "Windows"
+    $script:AgentIde = "cli"
+    $script:AgentRole = "worker"
+    $script:AgentCapabilities = '["claude"]'
+    Write-AgentLog "WARN" "No identity file at $IdentityFile; using defaults (agentId=$($script:AgentId))"
+}
 
+# -- PID Management -------------------------------------------
+function Write-PidFile {
+    param([int]$Pid)
+    Set-Content -Path $PidFile -Value $Pid
+    Write-AgentLog "DEBUG" "PID $Pid written to $PidFile"
+}
+
+function Read-PidFile {
+    if (Test-Path $PidFile) {
+        return (Get-Content $PidFile -Raw).Trim()
+    }
+    return ""
+}
+
+function Test-AgentRunning {
+    $pid = Read-PidFile
+    if ($pid -and $pid -ne "") {
+        try {
+            $proc = Get-Process -Id ([int]$pid) -ErrorAction SilentlyContinue
+            if ($proc -and -not $proc.HasExited) { return $true }
+        }
+        catch { }
+    }
+    return $false
+}
+
+function Remove-PidFile {
+    Remove-Item -Path $PidFile -ErrorAction SilentlyContinue
+}
+
+# -- Task Execution Engines -----------------------------------
+function Invoke-TaskClaude {
+    param([string]$TaskId, [string]$Prompt, [string]$WorkingDir)
+    Write-AgentLog "INFO" "Spawning Claude for task $TaskId"
+    $outputFile = Join-Path $LogDir "task-$TaskId.log"
+
+    if (Get-Command "claude" -ErrorAction SilentlyContinue) {
+        Push-Location $WorkingDir
+        try {
+            & claude -p $Prompt --permission-mode accept 2>&1 | Tee-Object -FilePath $outputFile
+            $exitCode = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+        Write-AgentLog "INFO" "Claude finished task $TaskId (exit=$exitCode)"
+        return $exitCode
+    }
+    else {
+        Write-AgentLog "ERROR" "Claude CLI not found"
+        return 1
+    }
+}
+
+function Invoke-TaskCodex {
+    param([string]$TaskId, [string]$Prompt, [string]$WorkingDir)
+    Write-AgentLog "INFO" "Spawning Codex for task $TaskId"
+    $outputFile = Join-Path $LogDir "task-$TaskId.log"
+
+    if (Get-Command "codex" -ErrorAction SilentlyContinue) {
+        Push-Location $WorkingDir
+        try {
+            & codex exec $Prompt 2>&1 | Tee-Object -FilePath $outputFile
+            $exitCode = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+        Write-AgentLog "INFO" "Codex finished task $TaskId (exit=$exitCode)"
+        return $exitCode
+    }
+    else {
+        Write-AgentLog "ERROR" "Codex CLI not found"
+        return 1
+    }
+}
+
+function Invoke-TaskGemini {
+    param([string]$TaskId, [string]$Prompt, [string]$WorkingDir)
+    Write-AgentLog "INFO" "Spawning Gemini for task $TaskId"
+    $outputFile = Join-Path $LogDir "task-$TaskId.log"
+
+    if (Get-Command "gemini" -ErrorAction SilentlyContinue) {
+        Push-Location $WorkingDir
+        try {
+            $Prompt | & gemini 2>&1 | Tee-Object -FilePath $outputFile
+            $exitCode = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+        Write-AgentLog "INFO" "Gemini finished task $TaskId (exit=$exitCode)"
+        return $exitCode
+    }
+    else {
+        Write-AgentLog "ERROR" "Gemini CLI not found"
+        return 1
+    }
+}
+
+function Invoke-Task {
+    param([string]$TaskId, [string]$Engine, [string]$Prompt, [string]$WorkingDir)
+    if (-not $WorkingDir) { $WorkingDir = $ProjectRoot }
+
+    switch ($Engine) {
+        "claude"  { return Invoke-TaskClaude -TaskId $TaskId -Prompt $Prompt -WorkingDir $WorkingDir }
+        "codex"   { return Invoke-TaskCodex -TaskId $TaskId -Prompt $Prompt -WorkingDir $WorkingDir }
+        "gemini"  { return Invoke-TaskGemini -TaskId $TaskId -Prompt $Prompt -WorkingDir $WorkingDir }
+        default {
+            Write-AgentLog "ERROR" "Unknown engine: $Engine (falling back to claude)"
+            return Invoke-TaskClaude -TaskId $TaskId -Prompt $Prompt -WorkingDir $WorkingDir
+        }
+    }
+}
+
+# -- Node.js WebSocket Client Script -------------------------
 function Get-WsClientScript {
-    param(
-        [string]$WsUrl,
-        [string]$AgentName,
-        [string]$TaskFilePath
-    )
-
-    $qs = "agentId=$([uri]::EscapeDataString($AgentName))"
-    if ($ApiKey) { $qs += "&apiKey=$ApiKey" }
-    $fullUrl = "${WsUrl}?${qs}"
-    $eng = Get-Engine
-
-    return @"
+    return @'
 const WebSocket = require('ws');
-const fs = require('fs');
-const url = '$fullUrl';
-const taskFile = '$($TaskFilePath -replace '\\','\\\\')';
 
-let reconnectDelay = $ReconnectDelay;
-const maxDelay = $MaxReconnectDelay;
-let alive = true;
+const HUB_URL = process.env.CORTEX_HUB_WS_URL;
+const AGENT_ID = process.env.CORTEX_AGENT_ID;
+const AGENT_HOSTNAME = process.env.CORTEX_AGENT_HOSTNAME;
+const AGENT_OS = process.env.CORTEX_AGENT_OS;
+const AGENT_IDE = process.env.CORTEX_AGENT_IDE;
+const AGENT_ROLE = process.env.CORTEX_AGENT_ROLE;
+const AGENT_CAPABILITIES = JSON.parse(process.env.CORTEX_AGENT_CAPABILITIES || '["claude"]');
 
-process.on('SIGTERM', () => { alive = false; process.exit(0); });
-process.on('SIGINT',  () => { alive = false; process.exit(0); });
+let ws = null;
+let reconnectAttempt = 0;
+const RECONNECT_BASE = 2000;
+const RECONNECT_MAX = 120000;
+let reconnectTimer = null;
+let pingInterval = null;
+
+function emit(type, data) {
+  const line = JSON.stringify({ type, ...data });
+  process.stdout.write(line + '\n');
+}
 
 function connect() {
-  const ws = new WebSocket(url);
+  if (ws) {
+    try { ws.terminate(); } catch (_) {}
+  }
+
+  emit('status', { message: `Connecting to ${HUB_URL}...` });
+  ws = new WebSocket(HUB_URL);
 
   ws.on('open', () => {
-    console.log('CONNECTED');
-    reconnectDelay = $ReconnectDelay;
-    ws.send(JSON.stringify({
+    reconnectAttempt = 0;
+    emit('status', { message: 'Connected to Hub conductor' });
+
+    const registration = {
       type: 'agent.register',
-      agentId: '$AgentName',
-      engine: '$eng',
-      capabilities: ['code', 'review', 'test'],
+      agentId: AGENT_ID,
+      hostname: AGENT_HOSTNAME,
+      os: AGENT_OS,
+      ide: AGENT_IDE,
+      role: AGENT_ROLE,
+      capabilities: AGENT_CAPABILITIES,
       timestamp: new Date().toISOString()
-    }));
-  });
+    };
+    ws.send(JSON.stringify(registration));
+    emit('registered', { agentId: AGENT_ID });
 
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === 'task.assigned') {
-        fs.writeFileSync(taskFile, JSON.stringify(msg, null, 2));
-        console.log('TASK:' + msg.taskId);
-      } else if (msg.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong' }));
-      } else {
-        console.log('MSG:' + msg.type);
+    if (pingInterval) clearInterval(pingInterval);
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.ping();
       }
+    }, 30000);
+  });
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      emit('message', { payload: msg });
     } catch (e) {
-      console.error('Parse error:', e.message);
+      emit('error', { message: `Invalid message: ${raw.toString().substring(0, 200)}` });
     }
   });
 
-  ws.on('close', () => {
-    console.log('DISCONNECTED');
-    if (alive) {
-      setTimeout(() => {
-        reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
-        connect();
-      }, reconnectDelay * 1000);
-    }
+  ws.on('close', (code, reason) => {
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    emit('disconnected', { code, reason: reason.toString() });
+    scheduleReconnect();
   });
 
   ws.on('error', (err) => {
-    console.error('WS_ERROR:' + err.message);
+    emit('error', { message: err.message });
+  });
+
+  ws.on('pong', () => {
+    emit('pong', { timestamp: new Date().toISOString() });
   });
 }
 
+function scheduleReconnect() {
+  reconnectAttempt++;
+  const delay = Math.min(RECONNECT_BASE * Math.pow(2, reconnectAttempt - 1), RECONNECT_MAX);
+  const jitter = Math.floor(Math.random() * 1000);
+  emit('status', { message: `Reconnecting in ${Math.round((delay + jitter) / 1000)}s (attempt ${reconnectAttempt})...` });
+  reconnectTimer = setTimeout(connect, delay + jitter);
+}
+
+function sendMessage(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+    return true;
+  }
+  return false;
+}
+
+process.stdin.setEncoding('utf8');
+let stdinBuffer = '';
+process.stdin.on('data', (chunk) => {
+  stdinBuffer += chunk;
+  let lines = stdinBuffer.split('\n');
+  stdinBuffer = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const cmd = JSON.parse(line);
+      if (cmd.type === 'send') {
+        sendMessage(cmd.payload);
+      } else if (cmd.type === 'quit') {
+        if (pingInterval) clearInterval(pingInterval);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (ws) ws.close(1000, 'Agent shutting down');
+        process.exit(0);
+      }
+    } catch (e) {
+      emit('error', { message: `Invalid stdin command: ${e.message}` });
+    }
+  }
+});
+
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
+
 connect();
-"@
+'@
 }
 
-# ---------------------------------------------------------------------------
-# Report task completion
-# ---------------------------------------------------------------------------
-
-function Send-Completion {
-    param(
-        [string]$TaskId,
-        [string]$Status,
-        [string]$Summary,
-        [string]$AgentName
-    )
-
-    $httpUrl = $Url -replace '^ws://', 'http://' -replace '^wss://', 'https://' -replace '/ws/conductor.*', ''
-
-    $body = @{
-        taskId      = $TaskId
-        agentId     = $AgentName
-        status      = $Status
-        summary     = $Summary
-        completedAt = (Get-Date).ToUniversalTime().ToString("o")
-    } | ConvertTo-Json
-
-    $headers = @{ "Content-Type" = "application/json" }
-    if ($ApiKey) { $headers["Authorization"] = "Bearer $ApiKey" }
-
-    try {
-        Invoke-RestMethod -Uri "$httpUrl/v1/tasks/$TaskId/complete" -Method Post -Body $body -Headers $headers | Out-Null
-    } catch {
-        Write-Warn "Failed to report completion for task $TaskId"
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Execute a task
-# ---------------------------------------------------------------------------
-
-function Invoke-Task {
-    param(
-        [string]$EngineCmd,
-        [string]$TaskDesc,
-        [string]$TaskId,
-        [string]$TaskBranch = ""
-    )
-
-    Write-Info "Executing task $TaskId with engine=$EngineCmd"
-
-    if ($TaskBranch) {
-        Write-Info "Checking out branch: $TaskBranch"
-        try {
-            git -C $RepoRoot checkout -B $TaskBranch 2>$null
-        } catch {
-            try { git -C $RepoRoot checkout $TaskBranch 2>$null } catch {
-                Write-Warn "Could not checkout branch $TaskBranch"
-            }
-        }
-    }
-
-    $outputFile = Join-Path $env:TEMP "cortex-task-output-$TaskId.txt"
-    $exitCode = 0
-
-    try {
-        switch ($EngineCmd) {
-            "claude" {
-                & claude -p $TaskDesc --allowedTools "Edit,Write,Bash,Read,Grep,Glob" --max-turns $MaxTurns *> $outputFile
-            }
-            "codex" {
-                & codex exec $TaskDesc *> $outputFile
-            }
-            "gemini" {
-                & gemini $TaskDesc *> $outputFile
-            }
-            default {
-                Write-Err "Unknown engine: $EngineCmd"
-                return $false
-            }
-        }
-    } catch {
-        $exitCode = 1
-    }
-
-    if ($exitCode -eq 0) {
-        Write-Ok "Task $TaskId completed successfully"
-        return $true
-    } else {
-        Write-Warn "Task $TaskId failed"
-        return $false
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Main agent loop
-# ---------------------------------------------------------------------------
-
+# -- Main Agent Loop ------------------------------------------
 function Start-AgentLoop {
-    $eng = Get-Engine
-    $agentName = Get-AgentName
+    $hubUrl = if ($env:CORTEX_HUB_WS_URL) { $env:CORTEX_HUB_WS_URL } else { $DefaultHubUrl }
+    $nodeResolvePaths = Join-Path $ProjectRoot "node_modules"
 
-    Initialize-CortexDir
-    Invoke-LogRotation
+    Write-AgentLog "INFO" "Starting cortex-agent"
+    Write-AgentLog "INFO" "Hub URL: $hubUrl"
+    Write-AgentLog "INFO" "Agent ID: $($script:AgentId)"
+    Write-AgentLog "INFO" "Capabilities: $($script:AgentCapabilities)"
 
-    Write-Info "Starting Cortex Agent"
-    Write-Info "  Engine:  $eng"
-    Write-Info "  Name:    $agentName"
-    Write-Info "  WS URL:  $Url"
-    Write-Info "  PID:     $PID"
-    Write-Info "  Log:     $LogFile"
+    # Set environment for the Node.js child process
+    $env:CORTEX_HUB_WS_URL = $hubUrl
+    $env:CORTEX_AGENT_ID = $script:AgentId
+    $env:CORTEX_AGENT_HOSTNAME = $script:AgentHostname
+    $env:CORTEX_AGENT_OS = $script:AgentOs
+    $env:CORTEX_AGENT_IDE = $script:AgentIde
+    $env:CORTEX_AGENT_ROLE = $script:AgentRole
+    $env:CORTEX_AGENT_CAPABILITIES = $script:AgentCapabilities
+    $env:NODE_PATH = $nodeResolvePaths
 
-    $PID | Out-File -FilePath $PidFile -NoNewline
+    # Write the Node.js script to a temp file
+    $wsScriptFile = Join-Path $env:TEMP "cortex-agent-ws-client.js"
+    Get-WsClientScript | Set-Content -Path $wsScriptFile -Encoding UTF8
 
-    $taskFile = Join-Path $env:TEMP "cortex-task-$PID.json"
+    # Start the Node.js WebSocket client process
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "node"
+    $psi.Arguments = $wsScriptFile
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.EnvironmentVariables["NODE_PATH"] = $nodeResolvePaths
+    $psi.EnvironmentVariables["CORTEX_HUB_WS_URL"] = $hubUrl
+    $psi.EnvironmentVariables["CORTEX_AGENT_ID"] = $script:AgentId
+    $psi.EnvironmentVariables["CORTEX_AGENT_HOSTNAME"] = $script:AgentHostname
+    $psi.EnvironmentVariables["CORTEX_AGENT_OS"] = $script:AgentOs
+    $psi.EnvironmentVariables["CORTEX_AGENT_IDE"] = $script:AgentIde
+    $psi.EnvironmentVariables["CORTEX_AGENT_ROLE"] = $script:AgentRole
+    $psi.EnvironmentVariables["CORTEX_AGENT_CAPABILITIES"] = $script:AgentCapabilities
 
-    # Start WebSocket client
-    Write-Info "Connecting to Hub WebSocket..."
-    $wsScript = Get-WsClientScript -WsUrl $Url -AgentName $agentName -TaskFilePath $taskFile
-    $wsScriptFile = Join-Path $env:TEMP "cortex-ws-client.js"
-    $wsScript | Out-File -FilePath $wsScriptFile -Encoding utf8
+    $nodeProc = [System.Diagnostics.Process]::Start($psi)
+    Write-PidFile -Pid $nodeProc.Id
 
-    $wsProcess = Start-Process -FilePath "node" -ArgumentList $wsScriptFile -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $CortexDir "ws-stdout.log") -RedirectStandardError (Join-Path $CortexDir "ws-stderr.log")
-    $wsProcess.Id | Out-File -FilePath $WsPidFile -NoNewline
+    Write-AgentLog "INFO" "WebSocket client started (pid=$($nodeProc.Id))"
 
-    Write-Info "WebSocket client PID: $($wsProcess.Id)"
+    # Handle Ctrl+C gracefully
+    $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+        try {
+            $nodeProc.StandardInput.WriteLine('{"type":"quit"}')
+            Start-Sleep -Seconds 1
+            if (-not $nodeProc.HasExited) { $nodeProc.Kill() }
+        }
+        catch { }
+        Remove-PidFile
+    }
 
     try {
-        while ($true) {
-            # Check WS client is alive
-            if ($wsProcess.HasExited) {
-                Write-Warn "WebSocket client died, restarting..."
-                $wsProcess = Start-Process -FilePath "node" -ArgumentList $wsScriptFile -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $CortexDir "ws-stdout.log") -RedirectStandardError (Join-Path $CortexDir "ws-stderr.log")
-                $wsProcess.Id | Out-File -FilePath $WsPidFile -NoNewline
+        # Read messages from Node.js process stdout
+        while (-not $nodeProc.HasExited) {
+            $line = $nodeProc.StandardOutput.ReadLine()
+            if ($null -eq $line) { break }
+            if ($line.Trim() -eq "") { continue }
+
+            Write-AgentLog "DEBUG" "WS recv: $line"
+
+            try {
+                $msg = $line | ConvertFrom-Json
+            }
+            catch {
+                Write-AgentLog "WARN" "Could not parse message: $line"
+                continue
             }
 
-            # Check for new task
-            if (Test-Path $taskFile) {
-                $taskJson = Get-Content $taskFile -Raw
-                Remove-Item $taskFile -Force
+            switch ($msg.type) {
+                "status" {
+                    Write-AgentLog "INFO" "status: $($msg.message)"
+                }
+                "registered" {
+                    Write-AgentLog "INFO" "registered: $($msg.agentId)"
+                }
+                "pong" {
+                    Write-AgentLog "DEBUG" "pong: $($msg.timestamp)"
+                }
+                "disconnected" {
+                    Write-AgentLog "WARN" "Disconnected from Hub (will auto-reconnect)"
+                }
+                "error" {
+                    Write-AgentLog "ERROR" "WS error: $($msg.message)"
+                }
+                "message" {
+                    $payload = $msg.payload
+                    $payloadType = $payload.type
 
-                try {
-                    $task = $taskJson | ConvertFrom-Json
-                    $taskId = $task.taskId
-                    $taskDesc = if ($task.description) { $task.description } else { $task.prompt }
-                    $taskBranch = $task.branch
+                    Write-AgentLog "DEBUG" "Payload type: $payloadType"
 
-                    if ($taskId -and $taskDesc) {
-                        Write-Info "Received task: $taskId"
+                    switch ($payloadType) {
+                        "task.assigned" {
+                            $taskId = if ($payload.taskId) { $payload.taskId } elseif ($payload.task.id) { $payload.task.id } else { "" }
+                            $engine = if ($payload.engine) { $payload.engine } elseif ($payload.task.engine) { $payload.task.engine } else { "claude" }
+                            $prompt = if ($payload.prompt) { $payload.prompt } elseif ($payload.task.prompt) { $payload.task.prompt } elseif ($payload.task.description) { $payload.task.description } else { "" }
+                            $workingDir = if ($payload.workingDir) { $payload.workingDir } elseif ($payload.task.workingDir) { $payload.task.workingDir } else { $ProjectRoot }
 
-                        $success = Invoke-Task -EngineCmd $eng -TaskDesc $taskDesc -TaskId $taskId -TaskBranch $taskBranch
+                            if (-not $taskId -or -not $prompt) {
+                                Write-AgentLog "ERROR" "Invalid task.assigned: missing taskId or prompt"
+                                continue
+                            }
 
-                        $status = if ($success) { "completed" } else { "failed" }
-                        $outputFile = Join-Path $env:TEMP "cortex-task-output-$taskId.txt"
-                        $summary = if (Test-Path $outputFile) {
-                            Get-Content $outputFile | Select-Object -Last 50 | Out-String
-                        } else { "Task $status" }
+                            Write-AgentLog "INFO" "Task assigned: $taskId (engine=$engine)"
 
-                        Send-Completion -TaskId $taskId -Status $status -Summary $summary -AgentName $agentName
-                        Invoke-LogRotation
-                    } else {
-                        Write-Warn "Received malformed task, skipping"
+                            # Report task accepted
+                            $acceptMsg = @{
+                                type = "send"
+                                payload = @{
+                                    type = "task.accepted"
+                                    taskId = $taskId
+                                    agentId = $script:AgentId
+                                    timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+                                }
+                            } | ConvertTo-Json -Compress
+                            $nodeProc.StandardInput.WriteLine($acceptMsg)
+
+                            # Execute task in a background job
+                            $jobParams = @{
+                                TaskId     = $taskId
+                                Engine     = $engine
+                                Prompt     = $prompt
+                                WorkingDir = $workingDir
+                            }
+
+                            Start-Job -ScriptBlock {
+                                param($TaskId, $Engine, $Prompt, $WorkingDir, $ScriptPath)
+                                # Re-dot-source the script is complex; inline execution
+                                $exitCode = 0
+                                try {
+                                    switch ($Engine) {
+                                        "claude" {
+                                            Push-Location $WorkingDir
+                                            & claude -p $Prompt --permission-mode accept 2>&1
+                                            $exitCode = $LASTEXITCODE
+                                            Pop-Location
+                                        }
+                                        "codex" {
+                                            Push-Location $WorkingDir
+                                            & codex exec $Prompt 2>&1
+                                            $exitCode = $LASTEXITCODE
+                                            Pop-Location
+                                        }
+                                        "gemini" {
+                                            Push-Location $WorkingDir
+                                            $Prompt | & gemini 2>&1
+                                            $exitCode = $LASTEXITCODE
+                                            Pop-Location
+                                        }
+                                        default {
+                                            Push-Location $WorkingDir
+                                            & claude -p $Prompt --permission-mode accept 2>&1
+                                            $exitCode = $LASTEXITCODE
+                                            Pop-Location
+                                        }
+                                    }
+                                }
+                                catch { $exitCode = 1 }
+                                return @{ exitCode = $exitCode; taskId = $TaskId }
+                            } -ArgumentList $jobParams.TaskId, $jobParams.Engine, $jobParams.Prompt, $jobParams.WorkingDir, $MyInvocation.MyCommand.Path | Out-Null
+
+                            # Check completed jobs periodically and report results
+                            $completedJobs = Get-Job -State Completed
+                            foreach ($job in $completedJobs) {
+                                $result = Receive-Job -Job $job
+                                $status = if ($result.exitCode -eq 0) { "completed" } else { "failed" }
+
+                                $completeMsg = @{
+                                    type = "send"
+                                    payload = @{
+                                        type = "task.complete"
+                                        taskId = $result.taskId
+                                        agentId = $script:AgentId
+                                        status = $status
+                                        exitCode = $result.exitCode
+                                        timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+                                    }
+                                } | ConvertTo-Json -Compress
+                                $nodeProc.StandardInput.WriteLine($completeMsg)
+
+                                Write-AgentLog "INFO" "Task $($result.taskId) $status (exit=$($result.exitCode))"
+                                Remove-Job -Job $job
+                            }
+                        }
+
+                        "agent.registered" {
+                            Write-AgentLog "INFO" "Server confirmed registration"
+                        }
+
+                        { $_ -in "heartbeat", "ping" } {
+                            $pongMsg = @{
+                                type = "send"
+                                payload = @{
+                                    type = "pong"
+                                    agentId = $script:AgentId
+                                    timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+                                }
+                            } | ConvertTo-Json -Compress
+                            $nodeProc.StandardInput.WriteLine($pongMsg)
+                        }
+
+                        default {
+                            Write-AgentLog "DEBUG" "Unhandled message type: $payloadType"
+                        }
                     }
-                } catch {
-                    Write-Warn "Failed to parse task: $_"
+                }
+                default {
+                    Write-AgentLog "DEBUG" "Unknown event type: $($msg.type)"
                 }
             }
-
-            Start-Sleep -Seconds 2
         }
-    } finally {
+    }
+    catch {
+        Write-AgentLog "ERROR" "Agent loop error: $_"
+    }
+    finally {
         # Cleanup
-        Write-Info "Shutting down agent..."
-        if (-not $wsProcess.HasExited) {
-            Stop-Process -Id $wsProcess.Id -Force -ErrorAction SilentlyContinue
+        try {
+            if (-not $nodeProc.HasExited) {
+                $nodeProc.StandardInput.WriteLine('{"type":"quit"}')
+                Start-Sleep -Seconds 2
+                if (-not $nodeProc.HasExited) { $nodeProc.Kill() }
+            }
         }
-        Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-        Remove-Item $WsPidFile -Force -ErrorAction SilentlyContinue
-        Remove-Item $taskFile -Force -ErrorAction SilentlyContinue
-        Write-Info "Agent stopped"
+        catch { }
+
+        Remove-PidFile
+        Remove-Item -Path $wsScriptFile -ErrorAction SilentlyContinue
+
+        # Clean up background jobs
+        Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
+
+        Write-AgentLog "INFO" "Agent stopped"
     }
 }
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
+# -- Commands -------------------------------------------------
 function Start-Agent {
-    Initialize-CortexDir
+    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+    Invoke-LogRotation
+    Test-Dependencies
+    Read-AgentIdentity
 
-    # Check if already running
-    if (Test-Path $PidFile) {
-        $existingPid = Get-Content $PidFile
-        try {
-            Get-Process -Id $existingPid -ErrorAction Stop | Out-Null
-            Write-Err "Agent already running (PID $existingPid). Use 'cortex-agent stop' first."
-            exit 1
-        } catch {
-            Write-Warn "Stale PID file found, cleaning up"
-            Remove-Item $PidFile -Force
-        }
+    if (Test-AgentRunning) {
+        $pid = Read-PidFile
+        Write-AgentLog "WARN" "Agent is already running (pid=$pid)"
+        Write-Host "Agent is already running (pid=$pid). Use 'stop' first." -ForegroundColor Yellow
+        exit 1
     }
 
-    if ($Foreground) {
+    if ($Daemon -or $Background) {
+        Write-AgentLog "INFO" "Starting agent in background mode..."
+        $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" start"
+        $proc = Start-Process powershell -ArgumentList $argList -WindowStyle Hidden -PassThru
+        Write-PidFile -Pid $proc.Id
+        Write-Host "Agent started in background (pid=$($proc.Id))" -ForegroundColor Green
+        Write-Host "Logs: Get-Content -Wait '$LogFile'" -ForegroundColor Blue
+    }
+    else {
+        Write-PidFile -Pid $PID
         Start-AgentLoop
-    } else {
-        Write-Info "Starting agent as background job..."
-        $argList = @("start", "-Foreground")
-        if ($Name) { $argList += @("-Name", $Name) }
-        if ($Engine) { $argList += @("-Engine", $Engine) }
-        if ($Url -ne "ws://cortex-api:4000/ws/conductor") { $argList += @("-Url", $Url) }
-        if ($ApiKey) { $argList += @("-ApiKey", $ApiKey) }
-
-        $proc = Start-Process -FilePath "pwsh" -ArgumentList (@("-File", $MyInvocation.MyCommand.Path) + $argList) -PassThru -NoNewWindow -RedirectStandardOutput $LogFile -RedirectStandardError (Join-Path $CortexDir "agent-error.log")
-        $proc.Id | Out-File -FilePath $PidFile -NoNewline
-        Write-Ok "Agent started (PID $($proc.Id))"
-        Write-Ok "Logs: Get-Content -Wait $LogFile"
     }
 }
 
 function Stop-Agent {
-    if (-not (Test-Path $PidFile)) {
-        Write-Warn "No agent PID file found. Agent may not be running."
-        return
+    if (-not (Test-AgentRunning)) {
+        Write-Host "Agent is not running." -ForegroundColor Yellow
+        exit 0
     }
 
-    $pid = [int](Get-Content $PidFile)
+    $pid = Read-PidFile
+    Write-AgentLog "INFO" "Stopping agent (pid=$pid)..."
+
     try {
-        $proc = Get-Process -Id $pid -ErrorAction Stop
-        Write-Info "Stopping agent (PID $pid)..."
-        Stop-Process -Id $pid -Force
-        $proc.WaitForExit(5000)
-        Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-        Remove-Item $WsPidFile -Force -ErrorAction SilentlyContinue
-        Write-Ok "Agent stopped"
-    } catch {
-        Write-Warn "Agent process $pid not found (stale PID file)"
-        Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-        Remove-Item $WsPidFile -Force -ErrorAction SilentlyContinue
+        $proc = Get-Process -Id ([int]$pid) -ErrorAction SilentlyContinue
+        if ($proc) {
+            $proc.Kill()
+            $proc.WaitForExit(10000)
+        }
+    }
+    catch { }
+
+    Remove-PidFile
+    Write-Host "Agent stopped." -ForegroundColor Green
+}
+
+function Show-AgentStatus {
+    if (Test-AgentRunning) {
+        $pid = Read-PidFile
+        Write-Host "Agent is running (pid=$pid)" -ForegroundColor Green
+        Write-Host "Log file: $LogFile" -ForegroundColor Blue
+        Write-Host "PID file: $PidFile" -ForegroundColor Blue
+
+        if (Test-Path $LogFile) {
+            Write-Host ""
+            Write-Host "Last 10 log lines:" -ForegroundColor Cyan
+            Get-Content $LogFile -Tail 10
+        }
+        exit 0
+    }
+    else {
+        Write-Host "Agent is not running." -ForegroundColor Yellow
+        exit 1
     }
 }
 
-function Show-Status {
-    Initialize-CortexDir
-
-    Write-Host "=== Cortex Agent Status ===" -ForegroundColor Blue
-
-    # Agent process
-    if (Test-Path $PidFile) {
-        $pid = [int](Get-Content $PidFile)
-        try {
-            Get-Process -Id $pid -ErrorAction Stop | Out-Null
-            Write-Host "  Agent:     running (PID $pid)" -ForegroundColor Green
-        } catch {
-            Write-Host "  Agent:     dead (stale PID $pid)" -ForegroundColor Red
-        }
-    } else {
-        Write-Host "  Agent:     stopped" -ForegroundColor Yellow
-    }
-
-    # WebSocket client
-    if (Test-Path $WsPidFile) {
-        $wsPid = [int](Get-Content $WsPidFile)
-        try {
-            Get-Process -Id $wsPid -ErrorAction Stop | Out-Null
-            Write-Host "  WebSocket: connected (PID $wsPid)" -ForegroundColor Green
-        } catch {
-            Write-Host "  WebSocket: disconnected" -ForegroundColor Red
-        }
-    } else {
-        Write-Host "  WebSocket: not started" -ForegroundColor Yellow
-    }
-
-    # Engine
-    $eng = try { Get-Engine } catch { "none" }
-    Write-Host "  Engine:    $eng"
-
-    # Name
-    $agentName = try { Get-AgentName } catch { "unknown" }
-    Write-Host "  Name:      $agentName"
-
-    # URL
-    Write-Host "  WS URL:    $Url"
-
-    # Log
+function Show-AgentLogs {
     if (Test-Path $LogFile) {
-        $logLines = (Get-Content $LogFile).Count
-        Write-Host "  Log:       $LogFile ($logLines lines)"
-        Write-Host ""
-        Write-Host "--- Last 5 log entries ---" -ForegroundColor Blue
-        Get-Content $LogFile | Select-Object -Last 5
+        Get-Content $LogFile -Tail $LogLines
+    }
+    else {
+        Write-Host "No log file found at $LogFile" -ForegroundColor Yellow
     }
 }
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+function Show-AgentHelp {
+    $help = @"
+cortex-agent.ps1 -- Cortex Hub WebSocket Agent Client
 
+Usage:
+  .\cortex-agent.ps1 start [-Daemon|-Background]  Start the agent
+  .\cortex-agent.ps1 stop                          Stop the running agent
+  .\cortex-agent.ps1 status                        Show agent status and recent logs
+  .\cortex-agent.ps1 logs [-LogLines N]            Show last N log lines (default: 50)
+  .\cortex-agent.ps1 help                          Show this help message
+
+Environment Variables:
+  CORTEX_HUB_WS_URL         Hub WebSocket URL (default: $DefaultHubUrl)
+  CORTEX_AGENT_ID            Override agent ID
+  CORTEX_AGENT_PID_FILE      Custom PID file location
+  CORTEX_AGENT_LOG_DIR       Custom log directory
+  CORTEX_AGENT_DEBUG         Set to 1 for debug logging
+
+Agent Identity:
+  Place a JSON file at: $IdentityFile
+  Fields: agentId, hostname, os, ide, role, capabilities
+
+Examples:
+  .\cortex-agent.ps1 start                    # Interactive mode (foreground)
+  .\cortex-agent.ps1 start -Daemon            # Background mode
+  `$env:CORTEX_HUB_WS_URL="ws://hub:4000/ws/conductor"; .\cortex-agent.ps1 start
+"@
+    Write-Host $help
+}
+
+# -- Entry Point ----------------------------------------------
 switch ($Command) {
     "start"  { Start-Agent }
     "stop"   { Stop-Agent }
-    "status" { Show-Status }
-    "help" {
-        Write-Host "Cortex Agent - Universal task executor with WebSocket connection"
-        Write-Host ""
-        Write-Host "Usage:"
-        Write-Host "  .\cortex-agent.ps1 start   [options]   Start the agent daemon"
-        Write-Host "  .\cortex-agent.ps1 stop                Stop the agent daemon"
-        Write-Host "  .\cortex-agent.ps1 status              Show agent status"
-        Write-Host ""
-        Write-Host "Options:"
-        Write-Host "  -Name <name>        Agent name (default: auto-detect)"
-        Write-Host "  -Engine <engine>    Engine: claude, codex, gemini (default: auto-detect)"
-        Write-Host "  -Url <ws-url>       WebSocket URL (default: ws://cortex-api:4000/ws/conductor)"
-        Write-Host "  -ApiKey <key>       Hub API key (or set HUB_API_KEY env var)"
-        Write-Host "  -MaxTurns <n>       Max turns for claude engine (default: 30)"
-        Write-Host "  -Foreground         Run in foreground (don't daemonize)"
-    }
+    "status" { Show-AgentStatus }
+    "logs"   { Show-AgentLogs }
+    "help"   { Show-AgentHelp }
+    default  { Show-AgentHelp }
 }

@@ -1,587 +1,665 @@
-#!/bin/bash
-# Cortex Agent — Universal task executor with WebSocket connection
-# Works with any IDE: Claude, Codex, Antigravity, Cursor
-#
-# Usage:
-#   cortex-agent start                          # Auto-detect IDE
-#   cortex-agent start --name "builder"         # Custom name
-#   cortex-agent start --engine claude          # Specify engine
-#   cortex-agent start --engine codex           # Use Codex
-#   cortex-agent start --url wss://hub.jackle.dev/ws/conductor
-#   cortex-agent stop                           # Stop daemon
-#   cortex-agent status                         # Show status
+#!/usr/bin/env bash
+# ============================================================
+# cortex-agent.sh — Cortex Hub WebSocket Agent Client
+# Connects to the Hub conductor via WebSocket, receives task
+# assignments in real time, and spawns AI engine processes.
+# ============================================================
 
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Constants & defaults
-# ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CORTEX_DIR="$REPO_ROOT/.cortex"
-PID_FILE="$CORTEX_DIR/agent.pid"
-LOG_FILE="$CORTEX_DIR/agent.log"
-TASK_FILE="/tmp/cortex-task-$$.json"
-WS_PID_FILE="$CORTEX_DIR/agent-ws.pid"
-MAX_LOG_LINES=1000
-RECONNECT_DELAY=5
-MAX_RECONNECT_DELAY=60
+# ── Constants ────────────────────────────────────────────────
+readonly SCRIPT_NAME="cortex-agent"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Defaults
-WS_URL="${CORTEX_WS_URL:-ws://cortex-api:4000/ws/conductor}"
-API_KEY="${HUB_API_KEY:-}"
-AGENT_NAME="${CORTEX_AGENT_NAME:-}"
-ENGINE=""
-MAX_TURNS=30
+readonly DEFAULT_HUB_URL="ws://localhost:4000/ws/conductor"
+readonly IDENTITY_FILE="$PROJECT_ROOT/.cortex/agent-identity.json"
+readonly PID_FILE="${CORTEX_AGENT_PID_FILE:-/tmp/cortex-agent.pid}"
+readonly LOG_DIR="${CORTEX_AGENT_LOG_DIR:-/tmp/cortex-agent-logs}"
+readonly LOG_FILE="$LOG_DIR/cortex-agent.log"
+readonly MAX_LOG_SIZE=10485760  # 10 MB
+readonly MAX_LOG_FILES=5
+readonly RECONNECT_BASE_DELAY=2
+readonly RECONNECT_MAX_DELAY=120
 
-# Colors
+# ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-BLUE='\033[0;34m'
 YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
+# ── Logging ──────────────────────────────────────────────────
 log() {
-  local ts
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  echo "[$ts] $*" >> "$LOG_FILE"
+  local level="$1"; shift
+  local timestamp
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+  local msg="[$timestamp] [$level] $*"
+  echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+  case "$level" in
+    ERROR) echo -e "${RED}$msg${NC}" ;;
+    WARN)  echo -e "${YELLOW}$msg${NC}" ;;
+    INFO)  echo -e "${GREEN}$msg${NC}" ;;
+    DEBUG) [ "${CORTEX_AGENT_DEBUG:-0}" = "1" ] && echo -e "${CYAN}$msg${NC}" ;;
+  esac
 }
 
-info()  { echo -e "${BLUE}[cortex-agent]${NC} $*"; log "INFO  $*"; }
-ok()    { echo -e "${GREEN}[cortex-agent]${NC} $*"; log "OK    $*"; }
-warn()  { echo -e "${YELLOW}[cortex-agent]${NC} $*"; log "WARN  $*"; }
-err()   { echo -e "${RED}[cortex-agent]${NC} $*" >&2; log "ERROR $*"; }
+log_info()  { log INFO "$@"; }
+log_warn()  { log WARN "$@"; }
+log_error() { log ERROR "$@"; }
+log_debug() { log DEBUG "$@"; }
 
-rotate_log() {
+# ── Helpers ──────────────────────────────────────────────────
+ensure_log_dir() {
+  mkdir -p "$LOG_DIR"
+}
+
+rotate_logs() {
   if [ -f "$LOG_FILE" ]; then
-    local lines
-    lines="$(wc -l < "$LOG_FILE" | tr -d ' ')"
-    if [ "$lines" -gt "$MAX_LOG_LINES" ]; then
-      local tmp="$LOG_FILE.tmp"
-      tail -n "$MAX_LOG_LINES" "$LOG_FILE" > "$tmp"
-      mv "$tmp" "$LOG_FILE"
+    local size
+    size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
+      local i=$MAX_LOG_FILES
+      while [ "$i" -gt 1 ]; do
+        local prev=$((i - 1))
+        [ -f "$LOG_FILE.$prev" ] && mv "$LOG_FILE.$prev" "$LOG_FILE.$i"
+        i=$prev
+      done
+      mv "$LOG_FILE" "$LOG_FILE.1"
+      log_info "Log rotated (exceeded ${MAX_LOG_SIZE} bytes)"
     fi
   fi
 }
 
-ensure_cortex_dir() {
-  mkdir -p "$CORTEX_DIR"
-}
-
-# ---------------------------------------------------------------------------
-# Engine detection
-# ---------------------------------------------------------------------------
-
-detect_engine() {
-  if [ -n "$ENGINE" ]; then
-    # Validate user-specified engine
-    if ! command -v "$ENGINE" >/dev/null 2>&1; then
-      err "Specified engine '$ENGINE' not found in PATH"
-      exit 1
-    fi
-    echo "$ENGINE"
-    return
+check_dependencies() {
+  local missing=()
+  if ! command -v node >/dev/null 2>&1; then
+    missing+=("node")
   fi
-
-  # Auto-detect in order of preference
-  if command -v claude >/dev/null 2>&1; then
-    echo "claude"
-  elif command -v codex >/dev/null 2>&1; then
-    echo "codex"
-  elif command -v gemini >/dev/null 2>&1; then
-    echo "gemini"
-  else
-    err "No supported engine found. Install one of: claude, codex, gemini"
+  # We need the ws package -- check via node
+  if ! node -e "require('ws')" 2>/dev/null; then
+    # Try from project node_modules
+    if ! node -e "require('$PROJECT_ROOT/node_modules/ws')" 2>/dev/null; then
+      missing+=("ws (npm package)")
+    fi
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    # jq is nice-to-have; we can use node for JSON parsing
+    log_debug "jq not found; using node for JSON parsing"
+  fi
+  if [ ${#missing[@]} -gt 0 ]; then
+    log_error "Missing dependencies: ${missing[*]}"
+    log_error "Install with: npm install -g ws  (or run pnpm install in project root)"
     exit 1
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Default agent name
-# ---------------------------------------------------------------------------
-
-resolve_agent_name() {
-  if [ -n "$AGENT_NAME" ]; then
-    echo "$AGENT_NAME"
-    return
-  fi
-
-  # Try to read from agent-identity.json
-  local identity_file="$CORTEX_DIR/agent-identity.json"
-  if [ -f "$identity_file" ] && command -v node >/dev/null 2>&1; then
-    local name
-    name="$(node -e "try{const d=require('$identity_file');console.log(d.hostname||d.name||'')}catch(e){}" 2>/dev/null)"
-    if [ -n "$name" ]; then
-      echo "$name"
-      return
-    fi
-  fi
-
-  # Fallback: hostname + engine
-  echo "$(hostname -s)-$(detect_engine)"
-}
-
-# ---------------------------------------------------------------------------
-# WebSocket client (Node.js — no external deps beyond what the project needs)
-# ---------------------------------------------------------------------------
-
-start_ws_client() {
-  local ws_url="$1"
-  local agent_name="$2"
-  local task_file="$3"
-
-  # Build query params
-  local qs="agentId=$(printf '%s' "$agent_name" | sed 's/ /%20/g')"
-  if [ -n "$API_KEY" ]; then
-    qs="${qs}&apiKey=$API_KEY"
-  fi
-
-  local full_url="${ws_url}?${qs}"
-
-  node -e "
-const WebSocket = require('ws');
-const fs = require('fs');
-const url = '${full_url}';
-const taskFile = '${task_file}';
-
-let reconnectDelay = ${RECONNECT_DELAY};
-const maxDelay = ${MAX_RECONNECT_DELAY};
-let alive = true;
-
-process.on('SIGTERM', () => { alive = false; process.exit(0); });
-process.on('SIGINT',  () => { alive = false; process.exit(0); });
-
-function connect() {
-  const ws = new WebSocket(url);
-
-  ws.on('open', () => {
-    console.log('CONNECTED');
-    reconnectDelay = ${RECONNECT_DELAY};
-
-    // Register identity
-    ws.send(JSON.stringify({
-      type: 'agent.register',
-      agentId: '${agent_name}',
-      engine: '${ENGINE:-auto}',
-      capabilities: ['code', 'review', 'test'],
-      timestamp: new Date().toISOString()
-    }));
-  });
-
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === 'task.assigned') {
-        fs.writeFileSync(taskFile, JSON.stringify(msg, null, 2));
-        console.log('TASK:' + msg.taskId);
-      } else if (msg.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong' }));
-      } else {
-        console.log('MSG:' + msg.type);
-      }
-    } catch (e) {
-      console.error('Parse error:', e.message);
-    }
-  });
-
-  ws.on('close', () => {
-    console.log('DISCONNECTED');
-    if (alive) {
-      setTimeout(() => {
-        reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
-        connect();
-      }, reconnectDelay * 1000);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error('WS_ERROR:' + err.message);
-  });
-}
-
-connect();
-" &
-
-  echo $!
-}
-
-# ---------------------------------------------------------------------------
-# Send completion report back to Hub via HTTP (simpler than WS for one-shot)
-# ---------------------------------------------------------------------------
-
-report_completion() {
-  local task_id="$1"
-  local status="$2"    # completed | failed
-  local summary="$3"
-  local agent_name="$4"
-
-  # Derive HTTP URL from WS URL
-  local http_url
-  http_url="$(echo "$WS_URL" | sed 's|^ws://|http://|;s|^wss://|https://|;s|/ws/conductor.*||')"
-
-  local payload
-  payload=$(node -e "console.log(JSON.stringify({
-    taskId: '${task_id}',
-    agentId: '${agent_name}',
-    status: '${status}',
-    summary: $(node -e "console.log(JSON.stringify(require('fs').readFileSync('/dev/stdin','utf8')))" <<< "$summary"),
-    completedAt: new Date().toISOString()
-  }))")
-
-  local auth_header=""
-  if [ -n "$API_KEY" ]; then
-    auth_header="-H \"Authorization: Bearer $API_KEY\""
-  fi
-
-  curl -s -X POST "${http_url}/v1/tasks/${task_id}/complete" \
-    -H "Content-Type: application/json" \
-    ${auth_header:+"$auth_header"} \
-    -d "$payload" >/dev/null 2>&1 || warn "Failed to report completion for task $task_id"
-}
-
-# ---------------------------------------------------------------------------
-# Execute a task with the detected engine
-# ---------------------------------------------------------------------------
-
-execute_task() {
-  local engine="$1"
-  local task_desc="$2"
-  local task_id="$3"
-  local task_branch="${4:-}"
-
-  info "Executing task $task_id with engine=$engine"
-
-  # Switch to task branch if specified
-  if [ -n "$task_branch" ]; then
-    info "Checking out branch: $task_branch"
-    git -C "$REPO_ROOT" checkout -B "$task_branch" 2>/dev/null || \
-      git -C "$REPO_ROOT" checkout "$task_branch" 2>/dev/null || \
-      warn "Could not checkout branch $task_branch"
-  fi
-
-  local exit_code=0
-  local output_file="/tmp/cortex-task-output-${task_id}.txt"
-
-  case "$engine" in
-    claude)
-      claude -p "$task_desc" \
-        --allowedTools "Edit,Write,Bash,Read,Grep,Glob" \
-        --max-turns "$MAX_TURNS" \
-        > "$output_file" 2>&1 || exit_code=$?
-      ;;
-    codex)
-      codex exec "$task_desc" \
-        > "$output_file" 2>&1 || exit_code=$?
-      ;;
-    gemini)
-      gemini "$task_desc" \
-        > "$output_file" 2>&1 || exit_code=$?
-      ;;
-    *)
-      err "Unknown engine: $engine"
-      return 1
-      ;;
-  esac
-
-  # Read last 50 lines as summary
-  local summary
-  summary="$(tail -n 50 "$output_file" 2>/dev/null || echo "(no output)")"
-
-  if [ "$exit_code" -eq 0 ]; then
-    ok "Task $task_id completed successfully"
-    return 0
+read_identity() {
+  if [ -f "$IDENTITY_FILE" ]; then
+    AGENT_ID=$(node -e "const d=require('$IDENTITY_FILE'); console.log(d.agentId || d.id || 'unknown')" 2>/dev/null || echo "cortex-agent")
+    AGENT_HOSTNAME=$(node -e "const d=require('$IDENTITY_FILE'); console.log(d.hostname || '')" 2>/dev/null || hostname)
+    AGENT_OS=$(node -e "const d=require('$IDENTITY_FILE'); console.log(d.os || '')" 2>/dev/null || uname -s)
+    AGENT_IDE=$(node -e "const d=require('$IDENTITY_FILE'); console.log(d.ide || 'cli')" 2>/dev/null || echo "cli")
+    AGENT_ROLE=$(node -e "const d=require('$IDENTITY_FILE'); console.log(d.role || 'worker')" 2>/dev/null || echo "worker")
+    AGENT_CAPABILITIES=$(node -e "const d=require('$IDENTITY_FILE'); console.log(JSON.stringify(d.capabilities || ['claude']))" 2>/dev/null || echo '["claude"]')
+    log_info "Loaded identity from $IDENTITY_FILE (agentId=$AGENT_ID)"
   else
-    warn "Task $task_id failed with exit code $exit_code"
+    AGENT_ID="${CORTEX_AGENT_ID:-cortex-agent-$(hostname -s 2>/dev/null || hostname)}"
+    AGENT_HOSTNAME="$(hostname)"
+    AGENT_OS="$(uname -s)"
+    AGENT_IDE="cli"
+    AGENT_ROLE="worker"
+    AGENT_CAPABILITIES='["claude"]'
+    log_warn "No identity file at $IDENTITY_FILE; using defaults (agentId=$AGENT_ID)"
+  fi
+}
+
+# ── PID Management ───────────────────────────────────────────
+write_pid() {
+  echo $$ > "$PID_FILE"
+  log_debug "PID $$ written to $PID_FILE"
+}
+
+read_pid() {
+  if [ -f "$PID_FILE" ]; then
+    cat "$PID_FILE"
+  else
+    echo ""
+  fi
+}
+
+is_running() {
+  local pid
+  pid=$(read_pid)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+cleanup_pid() {
+  rm -f "$PID_FILE"
+}
+
+# ── Task Execution Engines ───────────────────────────────────
+execute_task_claude() {
+  local task_id="$1"
+  local prompt="$2"
+  local working_dir="${3:-$PROJECT_ROOT}"
+
+  log_info "Spawning Claude for task $task_id"
+  local output_file="$LOG_DIR/task-${task_id}.log"
+
+  if command -v claude >/dev/null 2>&1; then
+    (
+      cd "$working_dir"
+      claude -p "$prompt" --permission-mode accept 2>&1 | tee "$output_file"
+    )
+    local exit_code=$?
+    log_info "Claude finished task $task_id (exit=$exit_code)"
+    return $exit_code
+  else
+    log_error "Claude CLI not found. Install: https://docs.anthropic.com/claude-code"
     return 1
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Main loop: watch for tasks from WebSocket
-# ---------------------------------------------------------------------------
+execute_task_codex() {
+  local task_id="$1"
+  local prompt="$2"
+  local working_dir="${3:-$PROJECT_ROOT}"
 
-run_agent_loop() {
-  local engine
-  engine="$(detect_engine)"
-  local agent_name
-  agent_name="$(resolve_agent_name)"
+  log_info "Spawning Codex for task $task_id"
+  local output_file="$LOG_DIR/task-${task_id}.log"
 
-  ensure_cortex_dir
-  rotate_log
-
-  info "Starting Cortex Agent"
-  info "  Engine:  $engine"
-  info "  Name:    $agent_name"
-  info "  WS URL:  $WS_URL"
-  info "  PID:     $$"
-  info "  Log:     $LOG_FILE"
-
-  # Write PID
-  echo $$ > "$PID_FILE"
-
-  # Clean up on exit
-  cleanup() {
-    info "Shutting down agent..."
-    # Kill WS client if running
-    if [ -f "$WS_PID_FILE" ]; then
-      local ws_pid
-      ws_pid="$(cat "$WS_PID_FILE")"
-      kill "$ws_pid" 2>/dev/null || true
-      rm -f "$WS_PID_FILE"
-    fi
-    rm -f "$PID_FILE" "$TASK_FILE"
-    info "Agent stopped"
-    exit 0
-  }
-  trap cleanup SIGINT SIGTERM EXIT
-
-  # Start WebSocket client
-  info "Connecting to Hub WebSocket..."
-  local ws_pid
-  ws_pid="$(start_ws_client "$WS_URL" "$agent_name" "$TASK_FILE")"
-  echo "$ws_pid" > "$WS_PID_FILE"
-  info "WebSocket client PID: $ws_pid"
-
-  # Main polling loop: check for task files written by WS client
-  while true; do
-    # Check WS client is still alive
-    if ! kill -0 "$ws_pid" 2>/dev/null; then
-      warn "WebSocket client died, restarting..."
-      ws_pid="$(start_ws_client "$WS_URL" "$agent_name" "$TASK_FILE")"
-      echo "$ws_pid" > "$WS_PID_FILE"
-    fi
-
-    # Check for new task
-    if [ -f "$TASK_FILE" ]; then
-      local task_json
-      task_json="$(cat "$TASK_FILE")"
-      rm -f "$TASK_FILE"
-
-      # Parse task fields using Node.js
-      local task_id task_desc task_branch
-      task_id="$(node -e "console.log(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).taskId||'')" <<< "$task_json")"
-      task_desc="$(node -e "console.log(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).description||JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).prompt||'')" <<< "$task_json")"
-      task_branch="$(node -e "console.log(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).branch||'')" <<< "$task_json")"
-
-      if [ -n "$task_id" ] && [ -n "$task_desc" ]; then
-        info "Received task: $task_id"
-        log "Task description: $task_desc"
-
-        local status="completed"
-        if execute_task "$engine" "$task_desc" "$task_id" "$task_branch"; then
-          status="completed"
-        else
-          status="failed"
-        fi
-
-        # Report back
-        local summary
-        summary="$(tail -n 50 "/tmp/cortex-task-output-${task_id}.txt" 2>/dev/null || echo "Task $status")"
-        report_completion "$task_id" "$status" "$summary" "$agent_name"
-
-        rotate_log
-      else
-        warn "Received malformed task, skipping"
-      fi
-    fi
-
-    sleep 2
-  done
+  if command -v codex >/dev/null 2>&1; then
+    (
+      cd "$working_dir"
+      codex exec "$prompt" 2>&1 | tee "$output_file"
+    )
+    local exit_code=$?
+    log_info "Codex finished task $task_id (exit=$exit_code)"
+    return $exit_code
+  else
+    log_error "Codex CLI not found"
+    return 1
+  fi
 }
 
-# ---------------------------------------------------------------------------
-# Commands: start / stop / status
-# ---------------------------------------------------------------------------
+execute_task_gemini() {
+  local task_id="$1"
+  local prompt="$2"
+  local working_dir="${3:-$PROJECT_ROOT}"
 
+  log_info "Spawning Gemini for task $task_id"
+  local output_file="$LOG_DIR/task-${task_id}.log"
+
+  if command -v gemini >/dev/null 2>&1; then
+    (
+      cd "$working_dir"
+      echo "$prompt" | gemini 2>&1 | tee "$output_file"
+    )
+    local exit_code=$?
+    log_info "Gemini finished task $task_id (exit=$exit_code)"
+    return $exit_code
+  else
+    log_error "Gemini CLI not found"
+    return 1
+  fi
+}
+
+execute_task() {
+  local task_id="$1"
+  local engine="$2"
+  local prompt="$3"
+  local working_dir="${4:-$PROJECT_ROOT}"
+
+  case "$engine" in
+    claude)  execute_task_claude "$task_id" "$prompt" "$working_dir" ;;
+    codex)   execute_task_codex "$task_id" "$prompt" "$working_dir" ;;
+    gemini)  execute_task_gemini "$task_id" "$prompt" "$working_dir" ;;
+    *)
+      log_error "Unknown engine: $engine (falling back to claude)"
+      execute_task_claude "$task_id" "$prompt" "$working_dir"
+      ;;
+  esac
+}
+
+# ── WebSocket Client (Node.js) ──────────────────────────────
+# We use an inline Node.js script with the ws package for
+# reliable WebSocket communication. The script communicates
+# with this bash process via stdout line protocol.
+generate_ws_client_script() {
+  local hub_url="$1"
+  cat << 'NODESCRIPT'
+const WebSocket = require('ws');
+const path = require('path');
+
+const HUB_URL = process.env.CORTEX_HUB_WS_URL;
+const AGENT_ID = process.env.CORTEX_AGENT_ID;
+const AGENT_HOSTNAME = process.env.CORTEX_AGENT_HOSTNAME;
+const AGENT_OS = process.env.CORTEX_AGENT_OS;
+const AGENT_IDE = process.env.CORTEX_AGENT_IDE;
+const AGENT_ROLE = process.env.CORTEX_AGENT_ROLE;
+const AGENT_CAPABILITIES = JSON.parse(process.env.CORTEX_AGENT_CAPABILITIES || '["claude"]');
+
+let ws = null;
+let reconnectAttempt = 0;
+const RECONNECT_BASE = 2000;
+const RECONNECT_MAX = 120000;
+let reconnectTimer = null;
+let pingInterval = null;
+
+function emit(type, data) {
+  const line = JSON.stringify({ type, ...data });
+  process.stdout.write(line + '\n');
+}
+
+function connect() {
+  if (ws) {
+    try { ws.terminate(); } catch (_) {}
+  }
+
+  emit('status', { message: `Connecting to ${HUB_URL}...` });
+  ws = new WebSocket(HUB_URL);
+
+  ws.on('open', () => {
+    reconnectAttempt = 0;
+    emit('status', { message: 'Connected to Hub conductor' });
+
+    // Register agent identity
+    const registration = {
+      type: 'agent.register',
+      agentId: AGENT_ID,
+      hostname: AGENT_HOSTNAME,
+      os: AGENT_OS,
+      ide: AGENT_IDE,
+      role: AGENT_ROLE,
+      capabilities: AGENT_CAPABILITIES,
+      timestamp: new Date().toISOString()
+    };
+    ws.send(JSON.stringify(registration));
+    emit('registered', { agentId: AGENT_ID });
+
+    // Start ping/keepalive every 30s
+    if (pingInterval) clearInterval(pingInterval);
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      }
+    }, 30000);
+  });
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      emit('message', { payload: msg });
+    } catch (e) {
+      emit('error', { message: `Invalid message: ${raw.toString().substring(0, 200)}` });
+    }
+  });
+
+  ws.on('close', (code, reason) => {
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    emit('disconnected', { code, reason: reason.toString() });
+    scheduleReconnect();
+  });
+
+  ws.on('error', (err) => {
+    emit('error', { message: err.message });
+    // on('close') will fire after this, triggering reconnect
+  });
+
+  ws.on('pong', () => {
+    emit('pong', { timestamp: new Date().toISOString() });
+  });
+}
+
+function scheduleReconnect() {
+  reconnectAttempt++;
+  const delay = Math.min(RECONNECT_BASE * Math.pow(2, reconnectAttempt - 1), RECONNECT_MAX);
+  const jitter = Math.floor(Math.random() * 1000);
+  emit('status', { message: `Reconnecting in ${Math.round((delay + jitter) / 1000)}s (attempt ${reconnectAttempt})...` });
+  reconnectTimer = setTimeout(connect, delay + jitter);
+}
+
+function sendMessage(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+    return true;
+  }
+  return false;
+}
+
+// Listen for commands from bash parent via stdin
+process.stdin.setEncoding('utf8');
+let stdinBuffer = '';
+process.stdin.on('data', (chunk) => {
+  stdinBuffer += chunk;
+  let lines = stdinBuffer.split('\n');
+  stdinBuffer = lines.pop(); // keep incomplete line in buffer
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const cmd = JSON.parse(line);
+      if (cmd.type === 'send') {
+        sendMessage(cmd.payload);
+      } else if (cmd.type === 'quit') {
+        if (pingInterval) clearInterval(pingInterval);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (ws) ws.close(1000, 'Agent shutting down');
+        process.exit(0);
+      }
+    } catch (e) {
+      emit('error', { message: `Invalid stdin command: ${e.message}` });
+    }
+  }
+});
+
+// Handle termination signals gracefully
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
+
+// Start connection
+connect();
+NODESCRIPT
+}
+
+# ── Main Agent Loop ──────────────────────────────────────────
+run_agent() {
+  local hub_url="${CORTEX_HUB_WS_URL:-$DEFAULT_HUB_URL}"
+  local node_resolve_paths="$PROJECT_ROOT/node_modules"
+
+  log_info "Starting $SCRIPT_NAME"
+  log_info "Hub URL: $hub_url"
+  log_info "Agent ID: $AGENT_ID"
+  log_info "Capabilities: $AGENT_CAPABILITIES"
+
+  write_pid
+
+  # Write the Node.js WS client script to a temp file
+  local ws_script_file="/tmp/cortex-agent-ws-$$.js"
+  generate_ws_client_script "$hub_url" > "$ws_script_file"
+
+  # Named pipes for bidirectional communication
+  local pipe_in="/tmp/cortex-agent-in-$$"
+  local pipe_out="/tmp/cortex-agent-out-$$"
+  rm -f "$pipe_in" "$pipe_out"
+  mkfifo "$pipe_in"
+  mkfifo "$pipe_out"
+
+  export CORTEX_HUB_WS_URL="$hub_url"
+  export CORTEX_AGENT_ID="$AGENT_ID"
+  export CORTEX_AGENT_HOSTNAME="$AGENT_HOSTNAME"
+  export CORTEX_AGENT_OS="$AGENT_OS"
+  export CORTEX_AGENT_IDE="$AGENT_IDE"
+  export CORTEX_AGENT_ROLE="$AGENT_ROLE"
+  export CORTEX_AGENT_CAPABILITIES="$AGENT_CAPABILITIES"
+  export NODE_PATH="$node_resolve_paths"
+
+  # Start the Node.js WebSocket client: reads from pipe_in, writes to pipe_out
+  NODE_PATH="$node_resolve_paths" node "$ws_script_file" < "$pipe_in" > "$pipe_out" 2>>"$LOG_FILE" &
+  local ws_pid=$!
+
+  log_debug "WebSocket client started (pid=$ws_pid)"
+
+  # Keep the write end of pipe_in open so node does not see EOF
+  exec 7>"$pipe_in"
+
+  # Cleanup on exit
+  trap 'log_info "Shutting down..."; echo "{\"type\":\"quit\"}" >&7 2>/dev/null; exec 7>&-; wait "$ws_pid" 2>/dev/null; cleanup_pid; rm -f "$pipe_in" "$pipe_out" "$ws_script_file"; exit 0' INT TERM
+
+  # Helper: send a command to the Node.js process
+  ws_send() {
+    echo "$1" >&7
+  }
+
+  # Helper: parse a JSON field using node (small inline call)
+  json_get() {
+    local json="$1"
+    local expr="$2"
+    echo "$json" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const o=JSON.parse(d);console.log($expr)}catch{console.log('')}})" 2>/dev/null || echo ""
+  }
+
+  # Read messages from WebSocket client and handle them
+  while IFS= read -r line < "$pipe_out"; do
+    [ -z "$line" ] && continue
+    log_debug "WS recv: $line"
+
+    local msg_type
+    msg_type=$(json_get "$line" "o.type||'unknown'")
+
+    case "$msg_type" in
+      status|registered|pong)
+        local status_msg
+        status_msg=$(json_get "$line" "o.message||o.agentId||''")
+        log_info "$msg_type: $status_msg"
+        ;;
+
+      disconnected)
+        log_warn "Disconnected from Hub (will auto-reconnect)"
+        ;;
+
+      error)
+        local err_msg
+        err_msg=$(json_get "$line" "o.message||''")
+        log_error "WS error: $err_msg"
+        ;;
+
+      message)
+        # Extract the payload from the message envelope
+        local payload
+        payload=$(json_get "$line" "JSON.stringify(o.payload)||'{}'")
+
+        local payload_type
+        payload_type=$(json_get "$payload" "o.type||''")
+
+        log_debug "Payload type: $payload_type"
+
+        case "$payload_type" in
+          task.assigned)
+            local task_id engine prompt working_dir
+            task_id=$(json_get "$payload" "o.taskId||(o.task&&o.task.id)||''")
+            engine=$(json_get "$payload" "o.engine||(o.task&&o.task.engine)||'claude'")
+            prompt=$(json_get "$payload" "o.prompt||(o.task&&o.task.prompt)||(o.task&&o.task.description)||''")
+            working_dir=$(json_get "$payload" "o.workingDir||(o.task&&o.task.workingDir)||''")
+            [ -z "$working_dir" ] && working_dir="$PROJECT_ROOT"
+
+            if [ -z "$task_id" ] || [ -z "$prompt" ]; then
+              log_error "Invalid task.assigned: missing taskId or prompt"
+              continue
+            fi
+
+            log_info "Task assigned: $task_id (engine=$engine)"
+
+            # Report task accepted
+            ws_send "{\"type\":\"send\",\"payload\":{\"type\":\"task.accepted\",\"taskId\":\"$task_id\",\"agentId\":\"$AGENT_ID\",\"timestamp\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}}"
+
+            # Execute task in background subshell
+            (
+              exit_code=0
+              execute_task "$task_id" "$engine" "$prompt" "$working_dir" && exit_code=0 || exit_code=$?
+
+              task_log_file="$LOG_DIR/task-${task_id}.log"
+              result=""
+              if [ -f "$task_log_file" ]; then
+                result=$(tail -c 500 "$task_log_file" | tr '\n' ' ' | sed 's/"/\\"/g')
+              fi
+
+              status="completed"
+              [ "$exit_code" -ne 0 ] && status="failed"
+
+              # Report task complete/failed back via WebSocket
+              echo "{\"type\":\"send\",\"payload\":{\"type\":\"task.complete\",\"taskId\":\"$task_id\",\"agentId\":\"$AGENT_ID\",\"status\":\"$status\",\"exitCode\":$exit_code,\"result\":\"$result\",\"timestamp\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}}" >&7
+
+              log_info "Task $task_id $status (exit=$exit_code)"
+            ) &
+            ;;
+
+          agent.registered)
+            log_info "Server confirmed registration"
+            ;;
+
+          heartbeat|ping)
+            # Respond to server heartbeats
+            ws_send "{\"type\":\"send\",\"payload\":{\"type\":\"pong\",\"agentId\":\"$AGENT_ID\",\"timestamp\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}}"
+            ;;
+
+          *)
+            log_debug "Unhandled message type: $payload_type"
+            ;;
+        esac
+        ;;
+
+      *)
+        log_debug "Unknown event type: $msg_type"
+        ;;
+    esac
+  done
+
+  # If we get here, the WS client has exited
+  log_warn "WebSocket client process exited"
+  exec 7>&-
+  wait "$ws_pid" 2>/dev/null
+  cleanup_pid
+  rm -f "$pipe_in" "$pipe_out" "$ws_script_file"
+}
+
+# ── Commands ─────────────────────────────────────────────────
 cmd_start() {
-  ensure_cortex_dir
+  ensure_log_dir
+  rotate_logs
+  check_dependencies
+  read_identity
 
-  # Check if already running
-  if [ -f "$PID_FILE" ]; then
-    local existing_pid
-    existing_pid="$(cat "$PID_FILE")"
-    if kill -0 "$existing_pid" 2>/dev/null; then
-      err "Agent already running (PID $existing_pid). Use 'cortex-agent stop' first."
-      exit 1
-    else
-      warn "Stale PID file found, cleaning up"
-      rm -f "$PID_FILE"
-    fi
+  if is_running; then
+    local pid
+    pid=$(read_pid)
+    log_warn "Agent is already running (pid=$pid)"
+    echo -e "${YELLOW}Agent is already running (pid=$pid). Use 'stop' first.${NC}"
+    exit 1
   fi
 
-  if [ "${FOREGROUND:-false}" = "true" ]; then
-    run_agent_loop
+  local daemon="${1:-}"
+  if [ "$daemon" = "--daemon" ] || [ "$daemon" = "-d" ]; then
+    log_info "Starting agent in daemon mode..."
+    nohup "$0" _run >> "$LOG_FILE" 2>&1 &
+    local bg_pid=$!
+    echo "$bg_pid" > "$PID_FILE"
+    echo -e "${GREEN}Agent started in background (pid=$bg_pid)${NC}"
+    echo -e "${BLUE}Logs: tail -f $LOG_FILE${NC}"
   else
-    info "Starting agent as background daemon..."
-    nohup bash "$0" _run_loop \
-      ${ENGINE:+--engine "$ENGINE"} \
-      ${AGENT_NAME:+--name "$AGENT_NAME"} \
-      --url "$WS_URL" \
-      >> "$LOG_FILE" 2>&1 &
-    local daemon_pid=$!
-    echo "$daemon_pid" > "$PID_FILE"
-    ok "Agent started (PID $daemon_pid)"
-    ok "Logs: tail -f $LOG_FILE"
+    run_agent
   fi
 }
 
 cmd_stop() {
-  if [ ! -f "$PID_FILE" ]; then
-    warn "No agent PID file found. Agent may not be running."
+  if ! is_running; then
+    echo -e "${YELLOW}Agent is not running.${NC}"
     exit 0
   fi
 
   local pid
-  pid="$(cat "$PID_FILE")"
+  pid=$(read_pid)
+  log_info "Stopping agent (pid=$pid)..."
+  kill "$pid" 2>/dev/null || true
+
+  # Wait up to 10 seconds for graceful shutdown
+  local count=0
+  while kill -0 "$pid" 2>/dev/null && [ $count -lt 10 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+
   if kill -0 "$pid" 2>/dev/null; then
-    info "Stopping agent (PID $pid)..."
-    kill "$pid"
-    # Wait up to 5s for graceful shutdown
-    local waited=0
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 5 ]; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      warn "Agent did not stop gracefully, sending SIGKILL"
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$PID_FILE" "$WS_PID_FILE"
-    ok "Agent stopped"
-  else
-    warn "Agent process $pid not found (stale PID file)"
-    rm -f "$PID_FILE" "$WS_PID_FILE"
+    log_warn "Force-killing agent (pid=$pid)..."
+    kill -9 "$pid" 2>/dev/null || true
   fi
+
+  cleanup_pid
+  echo -e "${GREEN}Agent stopped.${NC}"
 }
 
 cmd_status() {
-  ensure_cortex_dir
-
-  echo -e "${BLUE}=== Cortex Agent Status ===${NC}"
-
-  # Agent process
-  if [ -f "$PID_FILE" ]; then
+  if is_running; then
     local pid
-    pid="$(cat "$PID_FILE")"
-    if kill -0 "$pid" 2>/dev/null; then
-      echo -e "  Agent:     ${GREEN}running${NC} (PID $pid)"
-    else
-      echo -e "  Agent:     ${RED}dead${NC} (stale PID $pid)"
+    pid=$(read_pid)
+    echo -e "${GREEN}Agent is running (pid=$pid)${NC}"
+    echo -e "${BLUE}Log file: $LOG_FILE${NC}"
+    echo -e "${BLUE}PID file: $PID_FILE${NC}"
+    if [ -f "$LOG_FILE" ]; then
+      echo ""
+      echo -e "${CYAN}Last 10 log lines:${NC}"
+      tail -10 "$LOG_FILE" 2>/dev/null || true
     fi
+    exit 0
   else
-    echo -e "  Agent:     ${YELLOW}stopped${NC}"
+    echo -e "${YELLOW}Agent is not running.${NC}"
+    exit 1
   fi
+}
 
-  # WebSocket client
-  if [ -f "$WS_PID_FILE" ]; then
-    local ws_pid
-    ws_pid="$(cat "$WS_PID_FILE")"
-    if kill -0 "$ws_pid" 2>/dev/null; then
-      echo -e "  WebSocket: ${GREEN}connected${NC} (PID $ws_pid)"
-    else
-      echo -e "  WebSocket: ${RED}disconnected${NC}"
-    fi
-  else
-    echo -e "  WebSocket: ${YELLOW}not started${NC}"
-  fi
-
-  # Engine
-  local engine
-  engine="$(detect_engine 2>/dev/null || echo "none")"
-  echo -e "  Engine:    $engine"
-
-  # Name
-  local name
-  name="$(resolve_agent_name 2>/dev/null || echo "unknown")"
-  echo -e "  Name:      $name"
-
-  # WS URL
-  echo -e "  WS URL:    $WS_URL"
-
-  # Log file
+cmd_logs() {
   if [ -f "$LOG_FILE" ]; then
-    local log_lines
-    log_lines="$(wc -l < "$LOG_FILE" | tr -d ' ')"
-    echo -e "  Log:       $LOG_FILE ($log_lines lines)"
-    echo ""
-    echo -e "${BLUE}--- Last 5 log entries ---${NC}"
-    tail -n 5 "$LOG_FILE"
+    local lines="${1:-50}"
+    tail -"$lines" "$LOG_FILE"
+  else
+    echo -e "${YELLOW}No log file found at $LOG_FILE${NC}"
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+cmd_help() {
+  cat << EOF
+${BLUE}cortex-agent.sh${NC} — Cortex Hub WebSocket Agent Client
 
-parse_args() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --name)
-        AGENT_NAME="$2"; shift 2 ;;
-      --engine)
-        ENGINE="$2"; shift 2 ;;
-      --url)
-        WS_URL="$2"; shift 2 ;;
-      --api-key)
-        API_KEY="$2"; shift 2 ;;
-      --max-turns)
-        MAX_TURNS="$2"; shift 2 ;;
-      --foreground|-f)
-        FOREGROUND="true"; shift ;;
-      *)
-        shift ;;
-    esac
-  done
+${GREEN}Usage:${NC}
+  $0 start [--daemon|-d]    Start the agent (optionally in background)
+  $0 stop                   Stop the running agent
+  $0 status                 Show agent status and recent logs
+  $0 logs [N]               Show last N log lines (default: 50)
+  $0 help                   Show this help message
+
+${GREEN}Environment Variables:${NC}
+  CORTEX_HUB_WS_URL         Hub WebSocket URL (default: $DEFAULT_HUB_URL)
+  CORTEX_AGENT_ID            Override agent ID
+  CORTEX_AGENT_PID_FILE      Custom PID file location
+  CORTEX_AGENT_LOG_DIR       Custom log directory
+  CORTEX_AGENT_DEBUG         Set to 1 for debug logging
+
+${GREEN}Agent Identity:${NC}
+  Place a JSON file at: $IDENTITY_FILE
+  Fields: agentId, hostname, os, ide, role, capabilities
+
+${GREEN}Examples:${NC}
+  $0 start                  # Interactive mode (foreground)
+  $0 start --daemon         # Background daemon mode
+  CORTEX_HUB_WS_URL=ws://hub.example.com:4000/ws/conductor $0 start
+
+EOF
 }
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
+# ── Entry Point ──────────────────────────────────────────────
 main() {
   local command="${1:-help}"
   shift || true
 
-  parse_args "$@"
-
   case "$command" in
-    start)
-      cmd_start
-      ;;
-    stop)
-      cmd_stop
-      ;;
-    status)
-      cmd_status
-      ;;
-    _run_loop)
-      # Internal: called by daemon fork
-      FOREGROUND="true"
-      run_agent_loop
-      ;;
-    help|--help|-h)
-      echo "Cortex Agent — Universal task executor with WebSocket connection"
-      echo ""
-      echo "Usage:"
-      echo "  $(basename "$0") start   [options]   Start the agent daemon"
-      echo "  $(basename "$0") stop                Stop the agent daemon"
-      echo "  $(basename "$0") status              Show agent status"
-      echo ""
-      echo "Options:"
-      echo "  --name <name>        Agent name (default: auto-detect)"
-      echo "  --engine <engine>    Engine: claude, codex, gemini (default: auto-detect)"
-      echo "  --url <ws-url>       WebSocket URL (default: ws://cortex-api:4000/ws/conductor)"
-      echo "  --api-key <key>      Hub API key (or set HUB_API_KEY env var)"
-      echo "  --max-turns <n>      Max turns for claude engine (default: 30)"
-      echo "  --foreground, -f     Run in foreground (don't daemonize)"
+    start)   cmd_start "$@" ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    logs)    cmd_logs "$@" ;;
+    help|--help|-h) cmd_help ;;
+    _run)
+      # Internal: used by daemon mode to re-enter the script
+      ensure_log_dir
+      check_dependencies
+      read_identity
+      run_agent
       ;;
     *)
-      err "Unknown command: $command"
-      echo "Run '$(basename "$0") help' for usage"
+      echo -e "${RED}Unknown command: $command${NC}"
+      cmd_help
       exit 1
       ;;
   esac
