@@ -818,8 +818,10 @@ export interface ConductorTask {
   required_capabilities: string
   depends_on: string
   notify_on_complete: string
+  notified_agents: string
   context: string
   result: string | null
+  completed_by: string | null
   created_at: string
   assigned_at: string | null
   accepted_at: string | null
@@ -905,12 +907,13 @@ export async function getConductorAgents() {
   return apiFetch<{ agents: ConductorAgent[] }>('/api/metrics/conductor/agents')
 }
 
-export async function getConductorTasks(limit = 50, owner?: string) {
-  const params = new URLSearchParams({ limit: String(limit) })
-  if (owner) params.set('owner', owner)
-  return apiFetch<{ tasks: ConductorTask[]; stats: { pending: number; active: number; completed: number; total: number } }>(
-    `/api/metrics/conductor/tasks?${params.toString()}`
-  )
+export async function getConductorTasks(options?: { limit?: number; status?: string; assignedTo?: string }) {
+  const params = new URLSearchParams()
+  if (options?.limit) params.set('limit', String(options.limit))
+  if (options?.status) params.set('status', options.status)
+  if (options?.assignedTo) params.set('assigned_to', options.assignedTo)
+  const qs = params.toString()
+  return apiFetch<{ tasks: ConductorTask[] }>(`/api/conductor${qs ? `?${qs}` : ''}`)
 }
 
 // ── Conductor Task Stats ──
@@ -929,14 +932,30 @@ export async function getConductorTaskStats() {
 export async function createConductorTask(data: {
   title: string
   description?: string
-  assignTo?: string
+  assignedTo?: string
   priority?: number
+  projectId?: string
+  agentId?: string
+  apiKeyOwner?: string
+  metadata?: Record<string, unknown>
 }) {
-  const res = await fetch('/api/tasks', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  })
-  if (!res.ok) throw new Error('Failed to create task')
-  return res.json()
+  return apiFetch<{ task: ConductorTask }>('/api/conductor', { method: 'POST', body: data })
 }
+
+export async function updateConductorTask(id: string, data: {
+  status?: string
+  result?: unknown
+  context?: Record<string, unknown>
+  completedBy?: string
+}) {
+  return apiFetch<{ task: ConductorTask }>(`/api/conductor/${id}`, { method: 'PUT', body: data })
+}
+
+export async function cancelConductorTask(id: string) {
+  return apiFetch<{ success: boolean; id: string }>(`/api/conductor/${id}/cancel`, { method: 'POST' })
+}
+
+export async function deleteConductorTask(id: string) {
+  return apiFetch<{ success: boolean; id: string }>(`/api/conductor/${id}`, { method: 'DELETE' })
+}
+

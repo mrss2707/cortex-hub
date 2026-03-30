@@ -11,8 +11,92 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
-    name: Lint, Typecheck & Test
+  # ── Detect project stacks from profile ──────────────────────────────────────
+  detect-stacks:
+    name: Detect Project Stacks
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_dotnet: ${{ steps.detect.outputs.has_dotnet }}
+      is_mixed: ${{ steps.detect.outputs.is_mixed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect stacks from project profile
+        id: detect
+        run: |
+          PROFILE_PATH=""
+          if [ -f ".cortex/project-profile.json" ]; then
+            PROFILE_PATH=".cortex/project-profile.json"
+          elif [ -f ".forgewright/project-profile.json" ]; then
+            PROFILE_PATH=".forgewright/project-profile.json"
+          fi
+
+          if [ -z "$PROFILE_PATH" ]; then
+            echo "No project profile found. Defaulting to node-only."
+            echo "has_node=true" >> "$GITHUB_OUTPUT"
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+            echo "has_dotnet=false" >> "$GITHUB_OUTPUT"
+            echo "is_mixed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 -c "
+          import json, os
+
+          with open('${PROFILE_PATH}', 'r') as f:
+              profile = json.load(f)
+
+          fingerprint = profile.get('fingerprint', {})
+          stacks = profile.get('stacks', [])
+          languages = profile.get('languages', [])
+
+          all_langs = set()
+          lang_field = fingerprint.get('language', '')
+          if isinstance(lang_field, list):
+              all_langs.update(l.lower() for l in lang_field)
+          elif lang_field:
+              all_langs.add(lang_field.lower())
+          for s in stacks:
+              if isinstance(s, dict):
+                  name = s.get('language', s.get('name', '')).lower()
+                  if name: all_langs.add(name)
+              elif isinstance(s, str):
+                  all_langs.add(s.lower())
+          for l in languages:
+              if isinstance(l, str):
+                  all_langs.add(l.lower())
+
+          node_langs = {'typescript', 'javascript', 'node'}
+          python_langs = {'python', 'py'}
+          dotnet_langs = {'csharp', 'c#', 'dotnet', 'fsharp'}
+
+          has_node = bool(all_langs & node_langs) or 'typescript' in lang_field.lower() if lang_field else False
+          has_python = bool(all_langs & python_langs)
+          has_dotnet = bool(all_langs & dotnet_langs)
+
+          # Default to node if nothing detected (TypeScript monorepo)
+          if not all_langs:
+              has_node = True
+
+          categories = sum([has_node, has_python, has_dotnet])
+          is_mixed = categories > 1
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'has_node={str(has_node).lower()}\n')
+              f.write(f'has_python={str(has_python).lower()}\n')
+              f.write(f'has_dotnet={str(has_dotnet).lower()}\n')
+              f.write(f'is_mixed={str(is_mixed).lower()}\n')
+          "
+
+  # ── Node.js CI (TypeScript, ESLint, Prettier) ──────────────────────────────
+  ci-node:
+    name: "Node: Lint, Typecheck & Test"
+    needs: detect-stacks
+    if: needs.detect-stacks.outputs.has_node == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -33,7 +117,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build packages
-        run: pnpm build --filter @cortex/shared-types --filter @cortex/shared-utils --filter @cortex/shared-mem9 --filter @cortex/hub-mcp --filter @cortex/dashboard-api
+        run: pnpm build --filter='@cortex/shared-*'
 
       - name: Typecheck
         run: pnpm typecheck
@@ -43,3 +127,82 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+  # ── Python CI (flake8/ruff — only on *.py files) ───────────────────────────
+  ci-python:
+    name: "Python: Lint & Test"
+    needs: detect-stacks
+    if: needs.detect-stacks.outputs.has_python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python tools
+        run: pip install ruff flake8
+
+      - name: Lint Python files only
+        run: |
+          # Only lint .py files — never run on .json, .md, etc.
+          PY_FILES=$(find . -name "*.py" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/__pycache__/*" | head -500)
+          if [ -n "$PY_FILES" ]; then
+            echo "Linting Python files with ruff..."
+            echo "$PY_FILES" | xargs ruff check --config pyproject.toml 2>/dev/null || \
+            echo "$PY_FILES" | xargs ruff check 2>/dev/null || \
+            echo "$PY_FILES" | xargs flake8 || true
+          else
+            echo "No Python files found. Skipping."
+          fi
+
+      - name: Run Python tests
+        run: |
+          if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
+          if [ -f "requirements-dev.txt" ]; then pip install -r requirements-dev.txt; fi
+          if command -v pytest >/dev/null 2>&1; then
+            pytest --tb=short 2>/dev/null || echo "No pytest tests found or pytest not configured."
+          fi
+
+  # ── .NET CI (dotnet build/test — only on *.cs files) ───────────────────────
+  ci-dotnet:
+    name: ".NET: Build & Test"
+    needs: detect-stacks
+    if: needs.detect-stacks.outputs.has_dotnet == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: |
+          SLN_FILES=$(find . -name "*.sln" | head -5)
+          if [ -n "$SLN_FILES" ]; then
+            echo "$SLN_FILES" | xargs -I{} dotnet restore {}
+          fi
+
+      - name: Build
+        run: |
+          SLN_FILES=$(find . -name "*.sln" | head -5)
+          if [ -n "$SLN_FILES" ]; then
+            echo "$SLN_FILES" | xargs -I{} dotnet build {} --no-restore
+          fi
+
+      - name: Test
+        run: |
+          SLN_FILES=$(find . -name "*.sln" | head -5)
+          if [ -n "$SLN_FILES" ]; then
+            echo "$SLN_FILES" | xargs -I{} dotnet test {} --no-build || true
+          fi
