@@ -1,98 +1,166 @@
-# Cortex Conductor — Multi-Agent Task Orchestration
+# Cortex Conductor — Multi-Agent Task Orchestration (v2 Design)
 
-## Overview
+> Updated 2026-03-30: Corrected scope model, agent identity, and communication architecture.
 
-Conductor enables multiple AI agents across different machines and IDEs to collaborate on complex tasks. Agents can create tasks for each other, share results, and work in parallel with real-time visibility.
+## Core Principles
 
-## Agent Identity System
+1. **Tasks scoped per API key** — each API key = one user. Users only see their own agents/tasks.
+2. **Agents are uniquely identified** — not just API key name, but agentId + hostname + IDE + project + branch.
+3. **Real-time communication** — agents must receive tasks without manual polling.
 
-Each agent knows who it is, where it is, and what it can do.
+## Scope Model
 
-### 3-Layer Identity
+```
+API Key "Jack All 01" (User: Tiep)
+├── Agent: claude-mac (macOS, Claude Code CLI, cortex-hub, master)
+├── Agent: claude-vps-1 (Windows, Claude Code CLI, yulgang-re-tools, feat/extract)
+├── Agent: antigravity-mac (macOS, Antigravity, cortex-hub, master)
+└── Agent: cursor-win (Windows, Cursor, yulgang-re-tools, feat/ui)
 
-**Layer 1: Auto-detect (by install.sh)**
-Automatically detected at install time, stored in `.cortex/agent-identity.json`:
-- OS (macOS / Windows / Linux)
-- Hostname
-- Available tools (godot, dotnet, python, cargo, blender, etc.)
-- Project stacks detected
-- Machine specs (optional)
-
-**Layer 2: User-defined (edit `.cortex/agent-identity.json`)**
-User adds context the script can't detect:
-```json
-{
-  "role": "game-resource-extractor",
-  "capabilities": ["extract-textures", "extract-models", "convert-formats"],
-  "description": "Windows VPS with YG game client at C:\\YGOnline. Has access to all game resources.",
-  "resources": ["yg-game-client", "r2-upload-access"],
-  "tags": ["windows", "vps", "extraction", "gpu"]
-}
+API Key "thaingo" (User: Thai)
+├── Agent: claude-thai-1 (macOS, Claude Code, project-x, main)
+└── Agent: codex-thai (Linux, Codex, project-x, main)
 ```
 
-**Layer 3: Session registration (sent to Cortex Hub)**
-`cortex_session_start` sends identity to Hub. Other agents and Dashboard can see it.
+**Rule:** User Tiep can only create/assign tasks to agents under their own API key.
+Dashboard Conductor page filters by authenticated user's API key.
 
-### Identity File Schema (`.cortex/agent-identity.json`)
+## Agent Identity (Enhanced)
+
+### What `cortex_session_start` must send
 
 ```json
 {
-  "schema_version": "1.0",
-  "agent_name": "claude-vps-1",
-  "environment": {
-    "os": "windows",
-    "hostname": "WIN-VPS-01",
-    "arch": "x64",
-    "tools": ["python", "dotnet", "godot"],
-    "paths": {
-      "game_client": "C:\\YGOnline",
-      "output": "C:\\output"
-    }
-  },
-  "role": "game-resource-extractor",
-  "capabilities": ["extract-textures", "extract-models", "game-client", "r2-upload"],
-  "description": "Windows VPS with YG game client. Can extract and convert game resources.",
-  "resources": ["yg-game-client", "r2-storage"],
-  "tags": ["windows", "vps", "extraction"]
+  "repo": "https://github.com/lktiep/cortex-hub.git",
+  "mode": "development",
+  "agentId": "claude-code",
+  "identity": {
+    "sessionName": "claude-mac-cortex",
+    "hostname": "Tieps-MacBook-Pro",
+    "os": "macOS",
+    "ide": "claude-code-cli",
+    "project": "cortex-hub",
+    "branch": "master",
+    "role": "godot-game-builder",
+    "capabilities": ["godot", "build", "test"]
+  }
 }
 ```
 
-### Auto-Detection in install.sh
+### What Dashboard shows per agent
+
+```
+┌─ claude-mac-cortex ──────────────────────────────┐
+│ 🟢 online (last seen: 2s ago)                    │
+│                                                   │
+│ Host: Tieps-MacBook-Pro (macOS arm64)             │
+│ IDE:  Claude Code CLI                             │
+│ Project: cortex-hub @ master                      │
+│ Role: godot-game-builder                          │
+│ Caps: godot, build, test                          │
+│                                                   │
+│ Current task: [task_abc] Build Godot scene (60%)  │
+└───────────────────────────────────────────────────┘
+```
+
+### Online detection
+
+Agent is "online" if `last_activity` < 5 minutes ago.
+`last_activity` updated on every MCP tool call (already tracked in `query_logs`).
+
+## Communication Architecture
+
+### Problem
+
+```
+Dashboard creates task → assigns to Agent B
+Agent B is idle (waiting for user input)
+Agent B never calls MCP tool → never receives task
+```
+
+### Solution: Agent Worker Daemon
+
+A lightweight background process per machine that:
+1. Polls `cortex_task_pickup` every 30 seconds
+2. When task arrives, spawns `claude -p` (or `codex exec`) to execute
+3. Reports progress/completion back to Hub
 
 ```bash
-# Detect OS
-OS=$(uname -s)  # Darwin, Linux, MINGW64_NT (Windows Git Bash)
+# scripts/cortex-worker.sh — runs in background
+#!/bin/bash
+AGENT_ID="${1:-$(hostname)}"
+API_KEY="${HUB_API_KEY}"
+POLL_INTERVAL=30
 
-# Detect hostname
-HOSTNAME=$(hostname)
+while true; do
+  # Check for assigned tasks
+  TASKS=$(curl -s "${CORTEX_MCP_URL}" \
+    -H "Authorization: Bearer $API_KEY" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+         "params":{"name":"cortex_task_pickup","arguments":{"agentId":"'$AGENT_ID'"}}}')
 
-# Detect available tools
-TOOLS=()
-command -v godot >/dev/null && TOOLS+=("godot")
-command -v dotnet >/dev/null && TOOLS+=("dotnet")
-command -v python3 >/dev/null && TOOLS+=("python")
-command -v blender >/dev/null && TOOLS+=("blender")
-command -v cargo >/dev/null && TOOLS+=("cargo")
-command -v go >/dev/null && TOOLS+=("go")
-# ... etc
+  # If tasks found, execute with claude -p
+  TASK_COUNT=$(echo "$TASKS" | jq '.result.content[0].text' | grep -c "TASK")
+  if [ "$TASK_COUNT" -gt 0 ]; then
+    TASK_PROMPT=$(echo "$TASKS" | jq -r '.result.content[0].text')
+    claude -p "$TASK_PROMPT" \
+      --allowedTools "Bash,Read,Write,Edit" \
+      --max-budget-usd 5.00 \
+      --output-format json
+  fi
 
-# Generate .cortex/agent-identity.json (only if doesn't exist)
-# User can then edit to add role, capabilities, description
+  sleep $POLL_INTERVAL
+done
 ```
 
-## Task System
+**Launch:**
+```bash
+# Start worker daemon on each machine
+nohup bash scripts/cortex-worker.sh "claude-vps-1" &
 
-### Database Schema
+# Or via install.sh
+bash scripts/install.sh --worker  # starts daemon
+```
+
+### Future: WebSocket (v2)
+
+```
+Agent ←→ WebSocket ←→ Cortex Hub
+         persistent connection
+         Hub pushes tasks instantly
+         Agent sends progress updates
+```
+
+Requires MCP server architecture change (currently stateless HTTP).
+Could use a separate WebSocket service alongside MCP.
+
+## Database Schema (Updated)
+
+### Enhanced session_handoffs
+
+```sql
+ALTER TABLE session_handoffs ADD COLUMN hostname TEXT;
+ALTER TABLE session_handoffs ADD COLUMN os TEXT;
+ALTER TABLE session_handoffs ADD COLUMN ide TEXT;
+ALTER TABLE session_handoffs ADD COLUMN branch TEXT;
+ALTER TABLE session_handoffs ADD COLUMN capabilities TEXT DEFAULT '[]';
+ALTER TABLE session_handoffs ADD COLUMN role TEXT;
+ALTER TABLE session_handoffs ADD COLUMN last_activity TEXT;
+```
+
+### conductor_tasks (scoped by api_key_owner)
 
 ```sql
 CREATE TABLE IF NOT EXISTS conductor_tasks (
     id TEXT PRIMARY KEY,
+    api_key_owner TEXT NOT NULL,          -- scope: who owns this task
     title TEXT NOT NULL,
-    description TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
     project_id TEXT,
     parent_task_id TEXT,
-    created_by_agent TEXT,
-    assigned_to_agent TEXT,
+    created_by_agent TEXT,                -- agentId (not API key name)
+    created_by_session TEXT,              -- session ID
+    assigned_to_agent TEXT,               -- target agentId
     assigned_session_id TEXT,
     status TEXT DEFAULT 'pending'
         CHECK(status IN ('pending','assigned','accepted','in_progress','review','completed','failed','cancelled')),
@@ -100,183 +168,71 @@ CREATE TABLE IF NOT EXISTS conductor_tasks (
     required_capabilities TEXT DEFAULT '[]',
     depends_on TEXT DEFAULT '[]',
     notify_on_complete TEXT DEFAULT '[]',
+    notified_agents TEXT DEFAULT '[]',
     context TEXT DEFAULT '{}',
     result TEXT,
+    completed_by TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     assigned_at TEXT,
     accepted_at TEXT,
     completed_at TEXT
 );
-
-CREATE TABLE IF NOT EXISTS conductor_task_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id TEXT NOT NULL,
-    agent_id TEXT,
-    action TEXT NOT NULL,
-    message TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-);
 ```
 
-### MCP Tools (6 new tools)
+## Dashboard /conductor (Updated)
 
-| Tool | Input | Output | Description |
-|------|-------|--------|-------------|
-| `cortex_task_create` | title, description, assignTo?, capabilities?, dependsOn?, notifyOnComplete?, context? | task object | Create task, optionally assign |
-| `cortex_task_pickup` | agentId | tasks[] | Get tasks assigned to this agent |
-| `cortex_task_accept` | taskId | task + dependencies | Accept assigned task |
-| `cortex_task_update` | taskId, status, message?, result? | task | Report progress/completion |
-| `cortex_task_list` | projectId?, status?, assignedTo? | tasks[] | List/filter tasks |
-| `cortex_task_notify` | (system only) | — | Push notification via hint injection |
+### Active Agents panel
 
-### Hint Injection — Task Piggybacking
-
-Every MCP tool response already has a hints section. Enhanced to include:
+Only shows agents belonging to current user's API key scope.
+Only shows agents with `last_activity` < 5 minutes.
 
 ```
----
-CONDUCTOR: You have 1 new task assigned:
+Active Agents (3 online)
 
-[TASK task_abc] Priority: HIGH
-Title: Extract textures from map Odin
-From: claude-mac (Godot builder)
-Context: { map: "odin", format: "png", uploadTo: "r2://textures/odin/" }
+🟢 claude-mac-cortex          2s ago
+   macOS · Claude CLI · cortex-hub@master
 
-Call cortex_task_accept(taskId: "task_abc") to begin.
----
+🟢 claude-vps-1               15s ago
+   Windows · Claude CLI · yulgang-re-tools@feat/extract
+
+🟢 antigravity-mac            1m ago
+   macOS · Antigravity · cortex-hub@master
+
+🔴 cursor-win                 offline (2h ago)
+   Windows · Cursor · yulgang-re-tools@feat/ui
 ```
 
-Also, task completion notifications:
+### Task creation scoped to user's agents
 
-```
----
-CONDUCTOR: Task completed by another agent:
+"Assign to" dropdown only shows agents under the same API key.
 
-[DONE task_abc] "Extract textures from map Odin"
-Agent: claude-vps-1
-Result: 155 textures uploaded to r2://textures/odin/
-Duration: 3m 22s
+## Implementation Phases (Revised)
 
-You can now proceed with tasks that depended on this.
----
-```
+### Phase 1: Agent Identity in Sessions ← NEXT
+- Enhance `cortex_session_start` to accept identity fields
+- Store in `session_handoffs` table (new columns)
+- Dashboard Sessions page shows full agent info
+- Conductor shows only online agents (last_activity < 5min)
 
-## Dashboard UI — /conductor page
+### Phase 2: Task Scope per API Key
+- Add `api_key_owner` to conductor_tasks
+- All task queries filter by owner
+- Dashboard Conductor scoped to current user
 
-### Three Views
+### Phase 3: Agent Worker Daemon
+- `scripts/cortex-worker.sh` — background task poller
+- Spawns `claude -p` or `codex exec` for each task
+- `install.sh --worker` option to start daemon
+- Works with ALL IDEs (Claude, Codex, etc.)
 
-**1. Timeline View (default)**
-Shows all agents on parallel swimlanes with tasks flowing through time.
-Real-time updates via SWR polling (5s interval).
+### Phase 4: WebSocket Channel (v2)
+- Separate WebSocket service alongside MCP
+- Real-time bidirectional: task push + progress stream
+- Agent SDK integration
+- Dashboard live updates (no polling)
 
-**2. Task Board (Kanban)**
-Columns: Pending → Assigned → Active → Review → Done
-Drag task to agent to assign.
-
-**3. Agent Focus**
-Click an agent to see: identity, capabilities, current tasks, task history.
-
-### Agent Cards
-
-Each agent shown with full identity:
-```
-┌─ claude-vps-1 ──────────────────────────────────┐
-│ 🟢 active  │  Windows VPS  │  WIN-VPS-01        │
-│                                                  │
-│ Role: game-resource-extractor                    │
-│ Caps: extract-textures, game-client, r2-upload   │
-│ Tools: python, dotnet                            │
-│                                                  │
-│ Current: [task_abc] Extract textures (80%)       │
-│ Queue: 2 tasks pending                           │
-└──────────────────────────────────────────────────┘
-```
-
-## Workflow Examples
-
-### Example 1: Cross-Machine Resource Pipeline
-
-```
-Agent A (Claude CLI, macOS) — Godot builder:
-  1. cortex_session_start → registers as "godot-builder" with caps: [godot, build, test]
-  2. Building game scene, needs textures
-  3. cortex_task_create(
-       title: "Extract Odin textures",
-       assignTo: "claude-vps-1",   // knows VPS has game client
-       context: { map: "odin", uploadTo: "r2://textures/" },
-       notifyOnComplete: ["claude-mac"]
-     )
-  4. cortex_task_create(
-       title: "Design battle UI",
-       assignTo: "antigravity",    // Gemini good at design
-       notifyOnComplete: ["claude-mac"]
-     )
-  5. Continues working on physics (not blocked)
-
-Agent B (Claude CLI, Windows VPS) — extractor:
-  6. Next MCP call → receives task notification
-  7. cortex_task_accept("task_001")
-  8. Runs extraction, uploads to R2
-  9. cortex_task_update("task_001", status: "completed", result: { files: [...] })
-
-Agent C (Antigravity, Linux) — designer:
-  10. Next MCP call → receives task notification
-  11. cortex_task_accept("task_002")
-  12. Designs UI mockups
-  13. cortex_task_update("task_002", status: "completed", result: { mockups: [...] })
-
-Agent A (automatic notification):
-  14. Next MCP call → "task_001 completed: textures at r2://..."
-  15. Next MCP call → "task_002 completed: UI mockups ready"
-  16. Downloads textures, applies to Godot scene
-  17. Implements UI based on mockups
-```
-
-### Example 2: Code → Review → Deploy Pipeline
-
-```
-Agent A (Cursor, VS Code) — frontend dev:
-  1. Builds new feature in React
-  2. cortex_task_create(title: "Review PR #42", assignTo: "codex-reviewer", requiredCapabilities: ["review"])
-
-Agent B (Codex) — reviewer:
-  3. cortex_task_pickup() → "Review PR #42"
-  4. Reviews code, writes comments
-  5. cortex_task_update(status: "completed", result: { approved: true, comments: [...] })
-
-Agent A (notification):
-  6. "Review approved" → proceeds to merge
-```
-
-## Implementation Phases
-
-### Phase 1: Agent Identity (enhance install.sh)
-- Auto-detect environment in install.sh
-- Generate `.cortex/agent-identity.json`
-- Enhance `cortex_session_start` to send identity
-- Store identity in `session_handoffs` table (new columns)
-
-### Phase 2: Task Backend
-- DB tables: `conductor_tasks`, `conductor_task_logs`
-- API routes: `/api/tasks/*`
-- 6 MCP tools
-
-### Phase 3: Hint Injection Enhancement
-- Task assignment notifications in MCP responses
-- Task completion notifications
-- Dependency unblocking
-
-### Phase 4: Dashboard /conductor Page
-- Agent list with identity cards
-- Task board (Kanban)
-- Task creation + assignment UI
-
-### Phase 5: Timeline View
-- Swimlane visualization
-- Real-time progress tracking
+### Phase 5: Smart Orchestration
+- Auto-suggest assignment based on capabilities + workload
+- Task decomposition (AI breaks complex request into sub-tasks)
 - Dependency graph visualization
-
-### Phase 6: Smart Features
-- Auto-suggest assignment based on capabilities match
-- Task decomposition (AI breaks complex task into sub-tasks)
-- Workload balancing across agents
+- Cross-project task chains
