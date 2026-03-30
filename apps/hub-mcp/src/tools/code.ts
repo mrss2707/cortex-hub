@@ -35,21 +35,37 @@ export function registerCodeTools(server: McpServer, env: Env) {
     return response.json()
   }
 
+  // ── Helper: resolve repo name/URL → projectId ──
+  async function resolveRepo(repo?: string, projectId?: string): Promise<string | undefined> {
+    if (projectId) return projectId
+    if (!repo) return undefined
+    // Try as-is first (might be a valid repo name like "cortex-hub")
+    // GitNexus accepts repo name directly — return it
+    // Strip URL to get repo name: https://github.com/org/name.git → name
+    const name = repo
+      .replace(/\.git$/, '')
+      .replace(/^https?:\/\/.*\//, '')
+      .split('/').pop() || repo
+    return name
+  }
+
   // ── code_search — query codebase concepts and workflows ──
   server.tool(
     'cortex_code_search',
-    'Query the codebase for architecture concepts, execution flows, and file matches using GitNexus hybrid vector/AST search. Use projectId to scope to a specific project.',
+    'Query the codebase for architecture concepts, execution flows, and file matches using GitNexus hybrid vector/AST search. Accepts repo name (e.g. "cortex-hub"), git URL, or projectId.',
     {
       query: z.string().describe('Natural language or code query to search for'),
-      projectId: z.string().optional().describe('Project ID to scope search to'),
-      branch: z.string().optional().describe('Git branch to search (uses the indexed branch data)'),
+      repo: z.string().optional().describe('Repository name (e.g. "cortex-hub") or git URL. Preferred over projectId.'),
+      projectId: z.string().optional().describe('Project ID (e.g. "proj-704127e3"). Use repo name instead if possible.'),
+      branch: z.string().optional().describe('Git branch to search'),
       limit: z.number().optional().describe('Maximum flows to return (default: 5)'),
     },
-    async ({ query, projectId, branch, limit }) => {
+    async ({ query, repo, projectId, branch, limit }) => {
       try {
+        const resolvedProject = await resolveRepo(repo, projectId)
         const data = (await callIntel('search', {
           query,
-          projectId,
+          projectId: resolvedProject,
           branch,
           limit: limit ?? 5,
         })) as { data?: { formatted?: string }; success?: boolean }
@@ -152,15 +168,17 @@ export function registerCodeTools(server: McpServer, env: Env) {
     'Analyze the blast radius of changing a specific symbol (function, class, file) to verify downstream impact before making edits.',
     {
       target: z.string().describe('The name of the function, class, or file to analyze'),
-      projectId: z.string().optional().describe('Project ID to scope analysis to'),
+      repo: z.string().optional().describe('Repository name (e.g. "cortex-hub") or git URL'),
+      projectId: z.string().optional().describe('Project ID. Use repo name instead if possible.'),
       branch: z.string().optional().describe('Git branch to analyze'),
       direction: z.enum(['upstream', 'downstream']).optional().describe('Direction to analyze (default: downstream)'),
     },
-    async ({ target, projectId, branch, direction }) => {
+    async ({ target, repo, projectId, branch, direction }) => {
       try {
+        const resolvedProject = await resolveRepo(repo, projectId)
         const data = await callIntel('impact', {
           target,
-          projectId,
+          projectId: resolvedProject,
           branch,
           direction: direction ?? 'downstream',
         }) as { data?: { results?: { raw?: string } } }
@@ -281,12 +299,14 @@ export function registerCodeTools(server: McpServer, env: Env) {
     'Get a 360° view of a code symbol: its methods, callers, callees, and related execution flows. Essential for exploring class hierarchies and understanding how a symbol is used across the codebase.',
     {
       name: z.string().describe('The name of the function, class, or symbol to explore'),
-      projectId: z.string().optional().describe('Project ID to scope lookup to'),
+      repo: z.string().optional().describe('Repository name (e.g. "cortex-hub") or git URL'),
+      projectId: z.string().optional().describe('Project ID. Use repo name instead if possible.'),
       file: z.string().optional().describe('File path to disambiguate when multiple symbols share the same name'),
     },
-    async ({ name, projectId, file }) => {
+    async ({ name, repo, projectId, file }) => {
       try {
-        const data = await callIntel('context', { name, projectId, file }) as {
+        const resolvedProject = await resolveRepo(repo, projectId)
+        const data = await callIntel('context', { name, projectId: resolvedProject, file }) as {
           data?: { results?: { raw?: string } }
         }
 
@@ -336,11 +356,13 @@ export function registerCodeTools(server: McpServer, env: Env) {
     'Run Cypher queries directly against the GitNexus knowledge graph. Supports MATCH, RETURN, WHERE, ORDER BY for exploring code relationships.\n\nAvailable node properties: name, filePath. Use labels(n) for type.\nExample: MATCH (n) WHERE n.name CONTAINS "Attack" RETURN n.name, labels(n) LIMIT 20',
     {
       query: z.string().describe('Cypher query to run (e.g., MATCH (n:Function) RETURN n.name LIMIT 10)'),
-      projectId: z.string().optional().describe('Project ID to scope query to'),
+      repo: z.string().optional().describe('Repository name (e.g. "cortex-hub") or git URL'),
+      projectId: z.string().optional().describe('Project ID. Use repo name instead if possible.'),
     },
-    async ({ query, projectId }) => {
+    async ({ query, repo, projectId }) => {
       try {
-        const data = await callIntel('cypher', { query, projectId })
+        const resolvedProject = await resolveRepo(repo, projectId)
+        const data = await callIntel('cypher', { query, projectId: resolvedProject })
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
         }
@@ -430,17 +452,19 @@ export function registerCodeTools(server: McpServer, env: Env) {
     'cortex_code_read',
     'Read raw source code from an indexed repository. Returns full file content or a line range. Use after cortex_code_search to view complete files. Requires the project to be cloned via Code Indexing.',
     {
-      file: z.string().describe('Relative file path within the repo (e.g., "src/utils/auth.ts" or "GameServer/Logic/NpcAttackLogic.cs")'),
-      projectId: z.string().describe('Project ID to read from'),
+      file: z.string().describe('Relative file path within the repo (e.g., "src/utils/auth.ts")'),
+      repo: z.string().optional().describe('Repository name (e.g. "cortex-hub") or git URL'),
+      projectId: z.string().optional().describe('Project ID. Use repo name instead if possible.'),
       startLine: z.number().optional().describe('Start line (1-indexed, inclusive)'),
       endLine: z.number().optional().describe('End line (1-indexed, inclusive)'),
     },
-    async ({ file, projectId, startLine, endLine }) => {
+    async ({ file, repo, projectId, startLine, endLine }) => {
       try {
+        const resolvedProject = await resolveRepo(repo, projectId)
         const res = await fetch(`${apiUrl()}/api/intel/file-content`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectId, file, startLine, endLine }),
+          body: JSON.stringify({ projectId: resolvedProject, file, startLine, endLine }),
           signal: AbortSignal.timeout(10000),
         })
 
