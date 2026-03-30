@@ -395,7 +395,7 @@ if ($ToolName -eq "Bash") {
 exit 0
 '@ | Out-File -FilePath "$hooksDir\enforce-session.ps1" -Encoding utf8
 
-        # enforce-commit.ps1
+        # enforce-commit.ps1 (v4.0: full workflow compliance check)
         @'
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (git rev-parse --show-toplevel 2>$null) }
 if (-not $ProjectDir) { $ProjectDir = "." }
@@ -404,9 +404,15 @@ try {
     $json = [Console]::In.ReadToEnd() | ConvertFrom-Json
     $Command = $json.tool_input.command
 } catch { exit 0 }
-if ($Command -match "^git commit" -and -not (Test-Path (Join-Path $StateDir "quality-gates-passed"))) {
-    Write-Error "BLOCKED: Quality gates not passed. Run build/typecheck/lint first."
-    exit 2
+if ($Command -match "^git commit") {
+    $missing = @()
+    if (-not (Test-Path (Join-Path $StateDir "session-started"))) { $missing += "cortex_session_start (not called)" }
+    if (-not (Test-Path (Join-Path $StateDir "discovery-used"))) { $missing += "cortex_code_search or cortex_knowledge_search (0 calls)" }
+    if (-not (Test-Path (Join-Path $StateDir "quality-gates-passed"))) { $missing += "Quality gates: run build/typecheck/lint then cortex_quality_report" }
+    if ($missing.Count -gt 0) {
+        Write-Error ("BLOCKED: Cannot commit. Missing steps:`n  - " + ($missing -join "`n  - ") + "`nRead CLAUDE.md for required workflow.")
+        exit 2
+    }
 }
 if ($Command -match "^git push") {
     Write-Host "REMINDER: After push, call cortex_code_reindex." -ForegroundColor Yellow
