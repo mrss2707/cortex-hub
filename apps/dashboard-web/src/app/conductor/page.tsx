@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import useSWR from 'swr'
 import {
@@ -112,6 +112,35 @@ function PriorityBadge({ priority }: { priority: number }) {
       {label} ({priority})
     </span>
   )
+}
+
+/** Animated counter that counts up from 0 */
+function AnimatedCounter({ value }: { value: number }) {
+  const [display, setDisplay] = useState(0)
+  const ref = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (ref.current !== null) {
+      cancelAnimationFrame(ref.current)
+    }
+    const start = performance.now()
+    const from = display
+    const duration = 600
+    function tick(now: number) {
+      const elapsed = now - start
+      const progress = Math.min(elapsed / duration, 1)
+      // ease-out cubic
+      const eased = 1 - Math.pow(1 - progress, 3)
+      setDisplay(Math.round(from + (value - from) * eased))
+      if (progress < 1) {
+        ref.current = requestAnimationFrame(tick)
+      }
+    }
+    ref.current = requestAnimationFrame(tick)
+    return () => { if (ref.current !== null) cancelAnimationFrame(ref.current) }
+  }, [value]) // eslint-disable-line
+
+  return <>{display}</>
 }
 
 function TaskCard({
@@ -271,7 +300,7 @@ function TaskDetail({
                 )}
                 {task.assigned_to_agent && (
                   <>
-                    <span className={styles.delegationArrow}>{'\u2193'}</span>
+                    <span className={styles.delegationArrow}>&#x2193;</span>
                     <div className={styles.delegationStep}>
                       <span className={styles.delegationLabel}>Assigned to</span>
                       <code className={styles.delegationAgent}>{task.assigned_to_agent}</code>
@@ -280,7 +309,7 @@ function TaskDetail({
                 )}
                 {task.completed_by && (
                   <>
-                    <span className={styles.delegationArrow}>{'\u2193'}</span>
+                    <span className={styles.delegationArrow}>&#x2193;</span>
                     <div className={`${styles.delegationStep} ${styles.delegationStepDone}`}>
                       <span className={styles.delegationLabel}>Completed by</span>
                       <code className={styles.delegationAgent}>{task.completed_by}</code>
@@ -457,25 +486,33 @@ function PipelineRow({
   node,
   onSelect,
   isLast,
+  index = 0,
 }: {
   node: TaskTreeNode
   onSelect: () => void
   isLast: boolean
+  index?: number
 }) {
   const { task, children, depth } = node
   const hasChildren = children.length > 0
 
   return (
     <div
-      className={styles.pipelineRow}
+      className={`${styles.pipelineRow} ${styles.pipelineRowAnimated}`}
       onClick={onSelect}
-      style={{ paddingLeft: `${depth * 28 + 16}px` }}
+      style={{
+        paddingLeft: `${depth * 32 + 16}px`,
+        animationDelay: `${index * 50}ms`,
+      }}
     >
-      {/* Connector */}
+      {/* CSS-drawn tree connector */}
       {depth > 0 && (
-        <span className={styles.pipelineConnector}>
-          {isLast ? '\u2514' : '\u251C'}\u2500
-        </span>
+        <span className={`${styles.pipelineConnector} ${isLast ? styles.connectorLast : styles.connectorMid} ${
+          task.status === 'completed' ? styles.connectorCompleted
+          : task.status === 'in_progress' ? styles.connectorInProgress
+          : task.status === 'failed' ? styles.connectorFailed
+          : styles.connectorPending
+        }`} />
       )}
 
       {/* Status dot */}
@@ -488,24 +525,24 @@ function PipelineRow({
 
       {/* Title */}
       <span className={styles.pipelineTitle}>
-        {hasChildren && <span className={styles.pipelineExpandIcon}>{'\u25BC'}</span>}
+        {hasChildren && <span className={styles.pipelineExpandIcon}>&#x25BC;</span>}
         {task.title}
       </span>
 
-      {/* Agent flow: created_by → assigned_to → completed_by */}
+      {/* Agent flow */}
       <span className={styles.pipelineFlow}>
         {task.created_by_agent && (
           <code className={styles.flowAgent}>{task.created_by_agent}</code>
         )}
         {task.assigned_to_agent && (
           <>
-            <span className={styles.flowArrow}>{'\u2192'}</span>
+            <span className={styles.flowArrow}>&#x2192;</span>
             <code className={styles.flowAgent}>{task.assigned_to_agent}</code>
           </>
         )}
         {task.completed_by && task.completed_by !== task.assigned_to_agent && (
           <>
-            <span className={styles.flowArrow}>{'\u2192'}</span>
+            <span className={styles.flowArrow}>&#x2192;</span>
             <code className={styles.flowAgentDone}>{task.completed_by}</code>
           </>
         )}
@@ -561,7 +598,7 @@ function PipelineView({
             <h3 className={styles.pipelineHeaderTitle}>Task Pipeline</h3>
             <span className={styles.pipelineHeaderCount}>{pipelineTasks.length} tasks in {withChildren.length} pipelines</span>
           </div>
-          {pipelineTasks.map((node) => {
+          {pipelineTasks.map((node, idx) => {
             // Check if last sibling at this depth
             const siblings = pipelineTasks.filter((n) =>
               n.depth === node.depth && n.task.parent_task_id === node.task.parent_task_id
@@ -573,6 +610,7 @@ function PipelineView({
                 node={node}
                 onSelect={() => onSelectTask(node.task)}
                 isLast={isLast}
+                index={idx}
               />
             )
           })}
@@ -586,12 +624,13 @@ function PipelineView({
             <h3 className={styles.pipelineHeaderTitle}>Standalone Tasks</h3>
             <span className={styles.pipelineHeaderCount}>{orphans.length}</span>
           </div>
-          {orphans.map((node) => (
+          {orphans.map((node, idx) => (
             <PipelineRow
               key={node.task.id}
               node={node}
               onSelect={() => onSelectTask(node.task)}
               isLast
+              index={idx}
             />
           ))}
         </div>
@@ -662,38 +701,38 @@ export default function ConductorPage() {
     <DashboardLayout title="Conductor" subtitle="Task assignment and agent orchestration">
       {/* Stats */}
       <div className={styles.statsGrid}>
-        <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>T</span>
+        <div className={`card ${styles.statCard} ${styles.statCardTotal}`}>
+          <span className={`${styles.statIcon} ${styles.statIconTotal}`}>T</span>
           <div>
-            <div className={styles.statValue}>{counts.all}</div>
+            <div className={styles.statValue}><AnimatedCounter value={counts.all} /></div>
             <div className={styles.statLabel}>Total Tasks</div>
           </div>
         </div>
-        <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>P</span>
+        <div className={`card ${styles.statCard} ${styles.statCardPending}`}>
+          <span className={`${styles.statIcon} ${styles.statIconPending}`}>P</span>
           <div>
-            <div className={styles.statValue}>{counts.pending}</div>
+            <div className={styles.statValue}><AnimatedCounter value={counts.pending} /></div>
             <div className={styles.statLabel}>Pending</div>
           </div>
         </div>
-        <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>R</span>
+        <div className={`card ${styles.statCard} ${styles.statCardRunning}`}>
+          <span className={`${styles.statIcon} ${styles.statIconRunning}`}>R</span>
           <div>
-            <div className={styles.statValue}>{counts.in_progress}</div>
+            <div className={styles.statValue}><AnimatedCounter value={counts.in_progress} /></div>
             <div className={styles.statLabel}>Running</div>
           </div>
         </div>
-        <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>D</span>
+        <div className={`card ${styles.statCard} ${styles.statCardDone}`}>
+          <span className={`${styles.statIcon} ${styles.statIconDone}`}>D</span>
           <div>
-            <div className={styles.statValue}>{counts.completed}</div>
+            <div className={styles.statValue}><AnimatedCounter value={counts.completed} /></div>
             <div className={styles.statLabel}>Done</div>
           </div>
         </div>
-        <div className={`card ${styles.statCard}`}>
-          <span className={styles.statIcon}>F</span>
+        <div className={`card ${styles.statCard} ${styles.statCardFailed}`}>
+          <span className={`${styles.statIcon} ${styles.statIconFailed}`}>F</span>
           <div>
-            <div className={styles.statValue}>{counts.failed}</div>
+            <div className={styles.statValue}><AnimatedCounter value={counts.failed} /></div>
             <div className={styles.statLabel}>Failed</div>
           </div>
         </div>
@@ -711,19 +750,21 @@ export default function ConductorPage() {
             {agents.map((agent: ConductorAgent) => {
               const ideIcon = agent.ide === 'claude-code' ? 'C' : agent.ide === 'codex' ? 'X' : agent.ide === 'antigravity' ? 'G' : agent.ide === 'cursor' ? 'Cu' : 'A'
               const ideLabel = agent.ide === 'claude-code' ? 'Claude Code' : agent.ide === 'codex' ? 'OpenAI Codex' : agent.ide === 'antigravity' ? 'Antigravity (Gemini)' : agent.ide === 'cursor' ? 'Cursor' : agent.ide ?? 'Unknown'
+              const ideColorClass = agent.ide === 'claude-code' ? styles.ideBlue : agent.ide === 'codex' ? styles.ideGreen : agent.ide === 'antigravity' ? styles.idePurple : agent.ide === 'cursor' ? styles.ideOrange : styles.ideBlue
               const statusLabel = agent.status === 'idle' ? 'Idle' : agent.status === 'busy' ? 'Busy' : 'Online'
               const statusClass = agent.status === 'idle' ? styles.agentOnline : agent.status === 'busy' ? styles.agentBusy : styles.agentOnline
+              const statusBadgeClass = agent.status === 'busy' ? styles.agentStatusBadgeBusy : styles.agentStatusBadge
               const platform = agent.platform ?? (agent.hostname?.includes('Mac') ? 'macOS' : 'unknown')
 
               return (
                 <div key={agent.agentId} className={`card ${styles.agentCard}`}>
                   <div className={styles.agentHeader}>
-                    <span className={styles.agentIdeIcon}>{ideIcon}</span>
+                    <span className={`${styles.agentIdeIcon} ${ideColorClass}`}>{ideIcon}</span>
                     <div className={styles.agentIdentity}>
                       <strong className={styles.agentIdText}>{agent.agentId}</strong>
                       <span className={styles.agentIdeLabel}>{ideLabel}</span>
                     </div>
-                    <div className={styles.agentStatusBadge}>
+                    <div className={statusBadgeClass}>
                       <span className={`${styles.agentDot} ${statusClass}`} />
                       <span className={styles.agentStatusText}>{statusLabel}</span>
                     </div>
@@ -751,9 +792,14 @@ export default function ConductorPage() {
                   {/* Capabilities */}
                   {agent.capabilities && agent.capabilities.length > 0 ? (
                     <div className={styles.agentCaps}>
-                      {agent.capabilities.map((cap) => (
-                        <span key={cap} className={styles.capBadge}>{cap}</span>
-                      ))}
+                      {agent.capabilities.map((cap) => {
+                        const capClass = cap.includes('code') || cap.includes('edit') ? styles.capCode
+                          : cap.includes('test') || cap.includes('lint') ? styles.capTest
+                          : cap.includes('deploy') || cap.includes('build') ? styles.capDeploy
+                          : cap.includes('search') || cap.includes('read') ? styles.capSearch
+                          : styles.capDefault
+                        return <span key={cap} className={`${styles.capBadge} ${capClass}`}>{cap}</span>
+                      })}
                     </div>
                   ) : (
                     <div className={styles.agentCapsEmpty}>No capabilities registered</div>

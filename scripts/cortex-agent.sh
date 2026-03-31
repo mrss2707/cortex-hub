@@ -30,6 +30,7 @@ ide_engine() {
     codex)       echo "codex" ;;
     cursor)      echo "claude" ;;
     antigravity) echo "antigravity" ;;
+    gemini)      echo "gemini" ;;
     *)           echo "claude" ;;
   esac
 }
@@ -512,6 +513,28 @@ execute_task_codex() {
   fi
 }
 
+execute_task_antigravity() {
+  local task_id="$1"
+  local prompt="$2"
+  local working_dir="${3:-$PROJECT_ROOT}"
+
+  log_info "Spawning Antigravity for task $task_id"
+  local output_file="$LOG_DIR/task-${task_id}.log"
+
+  if command -v antigravity >/dev/null 2>&1; then
+    (
+      cd "$working_dir"
+      antigravity -p "$prompt" 2>&1 | tee "$output_file"
+    )
+    local exit_code=$?
+    log_info "Antigravity finished task $task_id (exit=$exit_code)"
+    return $exit_code
+  else
+    log_error "Antigravity CLI not found. Install: https://antigravity.dev"
+    return 1
+  fi
+}
+
 execute_task_gemini() {
   local task_id="$1"
   local prompt="$2"
@@ -541,9 +564,10 @@ execute_task() {
   local working_dir="${4:-$PROJECT_ROOT}"
 
   case "$engine" in
-    claude)                execute_task_claude "$task_id" "$prompt" "$working_dir" ;;
-    codex)                 execute_task_codex "$task_id" "$prompt" "$working_dir" ;;
-    antigravity|gemini)    execute_task_gemini "$task_id" "$prompt" "$working_dir" ;;
+    claude)        execute_task_claude "$task_id" "$prompt" "$working_dir" ;;
+    codex)         execute_task_codex "$task_id" "$prompt" "$working_dir" ;;
+    antigravity)   execute_task_antigravity "$task_id" "$prompt" "$working_dir" ;;
+    gemini)        execute_task_gemini "$task_id" "$prompt" "$working_dir" ;;
     *)
       log_error "Unknown engine: $engine (falling back to claude)"
       execute_task_claude "$task_id" "$prompt" "$working_dir"
