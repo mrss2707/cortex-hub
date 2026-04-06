@@ -584,62 +584,90 @@ knowledgeRouter.post('/health-check', async (c) => {
 
 // ── GET /recipe-stats — Recipe system health dashboard ──
 knowledgeRouter.get('/recipe-stats', (c) => {
-  // Capture attempts
-  const captureStats = db.prepare(`
-    SELECT status, COUNT(*) as count FROM recipe_capture_log
-    GROUP BY status
-  `).all() as Array<{ status: string; count: number }>
+  // Ensure recipe_capture_log table exists (may not on first deploy)
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS recipe_capture_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source TEXT NOT NULL CHECK(source IN ('task', 'session')),
+      source_id TEXT,
+      agent_id TEXT,
+      project_id TEXT,
+      status TEXT NOT NULL CHECK(status IN ('attempt', 'captured', 'derived', 'skipped', 'error')),
+      title TEXT,
+      doc_id TEXT,
+      error_message TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`)
+  } catch { /* already exists */ }
 
-  // Recent captures (last 7 days)
-  const recentCaptures = db.prepare(`
-    SELECT * FROM recipe_capture_log
-    WHERE created_at > datetime('now', '-7 days')
-    ORDER BY created_at DESC
-    LIMIT 20
-  `).all()
+  try {
+    // Capture attempts
+    const captureStats = db.prepare(`
+      SELECT status, COUNT(*) as count FROM recipe_capture_log
+      GROUP BY status
+    `).all() as Array<{ status: string; count: number }>
 
-  // Knowledge quality distribution
-  const qualityDist = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN selection_count > 0 THEN 1 ELSE 0 END) as selected,
-      SUM(CASE WHEN completion_count > 0 THEN 1 ELSE 0 END) as completed,
-      SUM(CASE WHEN fallback_count > 0 THEN 1 ELSE 0 END) as fallbacked,
-      SUM(selection_count) as totalSelections,
-      SUM(completion_count) as totalCompletions,
-      SUM(fallback_count) as totalFallbacks,
-      AVG(CASE WHEN selection_count >= 3 THEN CAST(completion_count AS REAL) / NULLIF(selection_count, 0) END) as avgEffectiveRate
-    FROM knowledge_documents
-    WHERE status = 'active'
-  `).get() as Record<string, number | null>
+    // Recent captures (last 7 days)
+    const recentCaptures = db.prepare(`
+      SELECT * FROM recipe_capture_log
+      WHERE created_at > datetime('now', '-7 days')
+      ORDER BY created_at DESC
+      LIMIT 20
+    `).all()
 
-  // Origin distribution
-  const originDist = db.prepare(`
-    SELECT origin, COUNT(*) as count FROM knowledge_documents
-    WHERE status = 'active'
-    GROUP BY origin
-  `).all() as Array<{ origin: string; count: number }>
+    // Knowledge quality distribution
+    const qualityDist = db.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN selection_count > 0 THEN 1 ELSE 0 END) as selected,
+        SUM(CASE WHEN completion_count > 0 THEN 1 ELSE 0 END) as completed,
+        SUM(CASE WHEN fallback_count > 0 THEN 1 ELSE 0 END) as fallbacked,
+        SUM(selection_count) as totalSelections,
+        SUM(completion_count) as totalCompletions,
+        SUM(fallback_count) as totalFallbacks,
+        AVG(CASE WHEN selection_count >= 3 THEN CAST(completion_count AS REAL) / NULLIF(selection_count, 0) END) as avgEffectiveRate
+      FROM knowledge_documents
+      WHERE status = 'active'
+    `).get() as Record<string, number | null>
 
-  // Evolution lineage count
-  const lineageCount = db.prepare('SELECT COUNT(*) as count FROM knowledge_lineage').get() as { count: number }
+    // Origin distribution
+    const originDist = db.prepare(`
+      SELECT origin, COUNT(*) as count FROM knowledge_documents
+      WHERE status = 'active'
+      GROUP BY origin
+    `).all() as Array<{ origin: string; count: number }>
 
-  // Usage log activity (last 7 days)
-  const usageActivity = db.prepare(`
-    SELECT action, COUNT(*) as count FROM knowledge_usage_log
-    WHERE created_at > datetime('now', '-7 days')
-    GROUP BY action
-  `).all() as Array<{ action: string; count: number }>
+    // Evolution lineage count
+    const lineageCount = db.prepare('SELECT COUNT(*) as count FROM knowledge_lineage').get() as { count: number }
 
-  return c.json({
-    capture: {
-      stats: Object.fromEntries(captureStats.map(s => [s.status, s.count])),
-      recent: recentCaptures,
-    },
-    quality: qualityDist,
-    origins: Object.fromEntries(originDist.map(o => [o.origin, o.count])),
-    lineage: lineageCount.count,
-    usage: Object.fromEntries(usageActivity.map(u => [u.action, u.count])),
-  })
+    // Usage log activity (last 7 days)
+    const usageActivity = db.prepare(`
+      SELECT action, COUNT(*) as count FROM knowledge_usage_log
+      WHERE created_at > datetime('now', '-7 days')
+      GROUP BY action
+    `).all() as Array<{ action: string; count: number }>
+
+    return c.json({
+      capture: {
+        stats: Object.fromEntries(captureStats.map(s => [s.status, s.count])),
+        recent: recentCaptures,
+      },
+      quality: qualityDist,
+      origins: Object.fromEntries(originDist.map(o => [o.origin, o.count])),
+      lineage: lineageCount.count,
+      usage: Object.fromEntries(usageActivity.map(u => [u.action, u.count])),
+    })
+  } catch (error) {
+    logger.error(`Recipe stats failed: ${String(error)}`)
+    // Return empty but valid data so UI still renders
+    return c.json({
+      capture: { stats: {}, recent: [] },
+      quality: { total: 0, selected: 0, completed: 0, fallbacked: 0, totalSelections: 0, totalCompletions: 0, totalFallbacks: 0, avgEffectiveRate: null },
+      origins: {},
+      lineage: 0,
+      usage: {},
+    })
+  }
 })
 
 // ── GET /tags — List unique tags ──
