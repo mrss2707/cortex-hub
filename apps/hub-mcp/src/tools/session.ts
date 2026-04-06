@@ -39,14 +39,20 @@ Resuming current objective from STATE.md.
       `.trim()
 
       // Register session with the dashboard API
+      // API_KEY_OWNER is injected by MCP auth middleware from the validated Bearer token
+      const apiKeyOwner = (env as unknown as Record<string, string>).API_KEY_OWNER ?? null
       let sessionId = `sess_${Math.random().toString(36).substr(2, 9)}`
       try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+        if (apiKeyOwner) {
+          headers['X-API-Key-Owner'] = apiKeyOwner
+        }
         const response = await fetch(`${env.DASHBOARD_API_URL}/api/sessions/start`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
             action: `session_start:${mode ?? 'development'}`,
-            project: repo,
+            repo,
             agentId: agentId ?? 'claude-code',
             hostname,
             os,

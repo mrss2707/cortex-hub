@@ -322,10 +322,12 @@ export const sessionsRouter = new Hono()
 sessionsRouter.post('/start', async (c) => {
   try {
     const body = await c.req.json()
-    const { repo, mode, agentId: bodyAgentId, hostname, os, ide, branch, capabilities, role } = body
+    // Accept both 'repo' (new) and 'project' (legacy) field names
+    const { repo: bodyRepo, project: bodyProject, mode, agentId: bodyAgentId, hostname, os, ide, branch, capabilities, role } = body as Record<string, unknown>
+    const repo = (bodyRepo ?? bodyProject) as string | undefined
 
     // Identity resolution: keep self-reported agentId, API key name tracked separately
-    const agentId = bodyAgentId
+    const agentId = bodyAgentId as string | undefined
     const apiKeyName = c.req.header('X-API-Key-Owner') || null
 
     // Safe migration: add api_key_name column if not exists
@@ -338,21 +340,36 @@ sessionsRouter.post('/start', async (c) => {
     }
 
     const normalizedRepo = repo
-      ? repo.replace(/\.git$/, '').replace(/\/$/, '')
+      ? (repo as string).replace(/\.git$/, '').replace(/\/$/, '')
       : 'unknown'
+
+    // Extract repo name from URL for fuzzy matching: https://github.com/org/name → name
+    const repoName = normalizedRepo !== 'unknown'
+      ? normalizedRepo.split('/').pop() ?? normalizedRepo
+      : null
 
     let project: Record<string, unknown> | undefined
     if (repo) {
-      const stmt = db.prepare(
+      // Try exact URL match first
+      project = db.prepare(
         `SELECT * FROM projects
          WHERE git_repo_url IN (?, ?, ?, ?)`
-      )
-      project = stmt.get(
+      ).get(
         normalizedRepo,
         `${normalizedRepo}.git`,
         `${normalizedRepo}/`,
-        repo
+        repo,
       ) as Record<string, unknown> | undefined
+
+      // Fallback: match by repo name (case-insensitive) against slug or name
+      if (!project && repoName) {
+        project = db.prepare(
+          `SELECT * FROM projects
+           WHERE slug = ? COLLATE NOCASE
+              OR name = ? COLLATE NOCASE
+              OR slug LIKE ? COLLATE NOCASE`
+        ).get(repoName, repoName, `%${repoName}%`) as Record<string, unknown> | undefined
+      }
     }
 
     let sessionId: string
