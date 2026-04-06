@@ -62,12 +62,14 @@ async function callGitNexus(
 }
 
 /**
- * Resolve a projectId to GitNexus-compatible repo name candidates.
+ * Resolve a projectId, slug, or human-readable name to GitNexus-compatible repo name candidates.
  * Returns ordered list of names to try — GitNexus may register repos by:
  *   1. slug (e.g., 'yulgangproject')
  *   2. git URL basename (e.g., 'YulgangProject')
  *   3. projectId folder name (e.g., 'proj-abc123')
- * All candidates are returned for fallback-based querying.
+ *
+ * Supports case-insensitive matching and search by name column,
+ * so agents can just say repo: "YulgangProject" without needing a projectId.
  */
 function resolveRepoNames(projectId: string): string[] {
   const candidates: string[] = []
@@ -78,9 +80,16 @@ function resolveRepoNames(projectId: string): string[] {
   }
 
   try {
+    // Case-insensitive lookup: match by id, slug, OR name
     const project = db.prepare(
-      'SELECT id, slug, git_repo_url FROM projects WHERE id = ? OR slug = ?'
-    ).get(projectId, projectId) as { id?: string; slug?: string; git_repo_url?: string } | undefined
+      `SELECT id, slug, name, git_repo_url FROM projects
+       WHERE id = ?
+          OR slug = ? COLLATE NOCASE
+          OR name = ? COLLATE NOCASE
+          OR name LIKE ? COLLATE NOCASE`
+    ).get(projectId, projectId, projectId, `%${projectId}%`) as {
+      id?: string; slug?: string; name?: string; git_repo_url?: string
+    } | undefined
 
     if (project) {
       // Strategy 1: Use slug
@@ -88,7 +97,7 @@ function resolveRepoNames(projectId: string): string[] {
         candidates.push(project.slug)
       }
 
-      // Strategy 2: Extract repo name from git URL
+      // Strategy 2: Extract repo name from git URL (preserves original casing)
       if (project.git_repo_url) {
         const repoName = project.git_repo_url
           .replace(/\.git$/, '')
@@ -99,7 +108,12 @@ function resolveRepoNames(projectId: string): string[] {
         }
       }
 
-      // Strategy 3: Use project ID (folder name in /app/data/repos/)
+      // Strategy 3: Use project name (human-readable, may differ from slug)
+      if (project.name && !candidates.includes(project.name)) {
+        candidates.push(project.name)
+      }
+
+      // Strategy 4: Use project ID (folder name in /app/data/repos/)
       if (project.id && !candidates.includes(project.id)) {
         candidates.push(project.id)
       }
@@ -504,32 +518,78 @@ export async function getGitNexusRepos() {
   }
 
   // Parse GitNexus raw response — may be array, object with repos, or raw text
-  let repos: Array<{ name: string; projectId: string; slug: string; symbols: number | string; gitUrl: string }> = []
+  type RepoEntry = { name: string; projectId: string; slug: string; symbols: number | string; relationships: number | string; flows: number | string; gitUrl: string; path: string; indexed: string }
+  let repos: RepoEntry[] = []
 
   const rawData = gitNexusResult as Record<string, unknown>
   if (rawData?.raw && typeof rawData.raw === 'string') {
-    // Raw text: parse repo names from lines
-    const repoNames = rawData.raw.split('\n').map(l => l.trim()).filter(l => l.length > 0)
-    repos = repoNames.map(name => {
-      const match = projectBySlug.get(name.toLowerCase()) ?? projectById.get(name)
-      return {
-        name,
-        projectId: match?.id ?? '',
-        slug: match?.slug ?? name,
-        symbols: match?.indexed_symbols ?? '?',
-        gitUrl: match?.git_repo_url ?? '',
+    // GitNexus raw output format (multi-line per repo):
+    //   cortex-hub — 909 symbols, 1656 relationships, 69 flows
+    //   Path: /app/data/repos/cortex-hub
+    //   Indexed: 2026-03-24T02:15:38.013Z
+    //
+    // Parse by detecting repo lines (contain " — " with stats)
+    const lines = rawData.raw.split('\n').map(l => l.trim())
+
+    let currentRepo: Partial<RepoEntry> | null = null
+
+    for (const line of lines) {
+      if (!line || line.startsWith('Indexed repositories')) continue
+
+      // Repo name line: "cortex-hub — 909 symbols, 1656 relationships, 69 flows"
+      const repoMatch = line.match(/^(.+?)\s+—\s+(\d+)\s+symbols?,\s*(\d+)\s+relationships?,\s*(\d+)\s+flows?/)
+      if (repoMatch) {
+        // Save previous repo
+        if (currentRepo?.name) {
+          repos.push(currentRepo as RepoEntry)
+        }
+        const repoName = repoMatch[1]!.trim()
+        const match = projectBySlug.get(repoName.toLowerCase()) ?? projectById.get(repoName)
+        currentRepo = {
+          name: match?.name ?? repoName,
+          projectId: match?.id ?? '',
+          slug: match?.slug ?? repoName,
+          symbols: match?.indexed_symbols ?? parseInt(repoMatch[2]!, 10),
+          relationships: parseInt(repoMatch[3]!, 10),
+          flows: parseInt(repoMatch[4]!, 10),
+          gitUrl: match?.git_repo_url ?? '',
+          path: '',
+          indexed: '',
+        }
+        continue
       }
-    })
+
+      // Path line: "Path: /app/data/repos/proj-5b9a75cd"
+      if (line.startsWith('Path:') && currentRepo) {
+        currentRepo.path = line.replace('Path:', '').trim()
+        continue
+      }
+
+      // Indexed line: "Indexed: 2026-03-24T02:15:38.013Z"
+      if (line.startsWith('Indexed:') && currentRepo) {
+        currentRepo.indexed = line.replace('Indexed:', '').trim()
+        continue
+      }
+    }
+
+    // Don't forget the last repo
+    if (currentRepo?.name) {
+      repos.push(currentRepo as RepoEntry)
+    }
   } else if (Array.isArray(rawData)) {
     repos = rawData.map((r: unknown) => {
       const name = typeof r === 'string' ? r : ((r as Record<string, string>).name ?? 'unknown')
       const match = projectBySlug.get(name.toLowerCase()) ?? projectById.get(name)
       return {
-        name,
+        name: match?.name ?? name,
         projectId: match?.id ?? '',
         slug: match?.slug ?? name,
         symbols: match?.indexed_symbols ?? '?',
+        relationships: '?',
+        flows: '?',
         gitUrl: match?.git_repo_url ?? '',
+        path: '',
+        indexed: '',
       }
     })
   }

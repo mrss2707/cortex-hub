@@ -209,6 +209,21 @@ CREATE TABLE IF NOT EXISTS knowledge_usage_log (
 CREATE INDEX IF NOT EXISTS idx_knowledge_usage_doc ON knowledge_usage_log(document_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_usage_task ON knowledge_usage_log(task_id);
 
+-- ── Recipe Capture Log (diagnostics — track attempts and failures) ──
+CREATE TABLE IF NOT EXISTS recipe_capture_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL CHECK(source IN ('task', 'session')),
+    source_id TEXT,
+    agent_id TEXT,
+    project_id TEXT,
+    status TEXT NOT NULL CHECK(status IN ('attempt', 'captured', 'derived', 'skipped', 'error')),
+    title TEXT,
+    doc_id TEXT,
+    error_message TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_recipe_capture_log_status ON recipe_capture_log(status);
+
 -- Insert default uncompleted setup status
 INSERT OR IGNORE INTO setup_status (id, completed) VALUES (1, 0);
 

@@ -757,10 +757,24 @@ conductorRouter.put('/:id', async (c) => {
       // Fire-and-forget recipe capture (OpenSpace-inspired auto-learning)
       if (updatedTask.result) {
         import('../services/recipe-capture.js').then(({ captureFromTask }) =>
-          captureFromTask(updatedTask).catch(e =>
+          captureFromTask(updatedTask).catch(e => {
             console.warn('[recipe-capture] Task capture error:', (e as Error).message)
-          )
-        ).catch(() => { /* module load failure — non-critical */ })
+            try {
+              db.prepare(
+                `INSERT INTO recipe_capture_log (source, source_id, agent_id, project_id, status, error_message)
+                 VALUES ('task', ?, ?, ?, 'error', ?)`
+              ).run(id, existing.assigned_to_agent ?? null, existing.project_id ?? null, (e as Error).message?.slice(0, 500))
+            } catch { /* ignore */ }
+          })
+        ).catch((e) => {
+          console.warn('[recipe-capture] Module load error:', (e as Error).message)
+          try {
+            db.prepare(
+              `INSERT INTO recipe_capture_log (source, source_id, status, error_message)
+               VALUES ('task', ?, 'error', ?)`
+            ).run(id, `Module load: ${(e as Error).message}`.slice(0, 500))
+          } catch { /* ignore */ }
+        })
       }
     }
     if (status === 'failed') {

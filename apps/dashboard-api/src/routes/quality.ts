@@ -565,10 +565,24 @@ sessionsRouter.patch('/:id/complete', async (c) => {
           summary: task_summary,
           agentId: session.from_agent,
           projectId: session.project_id,
-        }).catch(e =>
+        }).catch(e => {
           console.warn('[recipe-capture] Session capture error:', (e as Error).message)
-        )
-      ).catch(() => { /* module load failure — non-critical */ })
+          try {
+            db.prepare(
+              `INSERT INTO recipe_capture_log (source, source_id, agent_id, project_id, status, error_message)
+               VALUES ('session', ?, ?, ?, 'error', ?)`
+            ).run(id, session.from_agent ?? null, session.project_id ?? null, (e as Error).message?.slice(0, 500))
+          } catch { /* ignore */ }
+        })
+      ).catch((e) => {
+        console.warn('[recipe-capture] Module load error:', (e as Error).message)
+        try {
+          db.prepare(
+            `INSERT INTO recipe_capture_log (source, source_id, status, error_message)
+             VALUES ('session', ?, 'error', ?)`
+          ).run(id, `Module load: ${(e as Error).message}`.slice(0, 500))
+        } catch { /* ignore */ }
+      })
     }
 
     return c.json({ success: true, id, status: status ?? 'completed' })

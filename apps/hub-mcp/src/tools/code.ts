@@ -401,7 +401,7 @@ export function registerCodeTools(server: McpServer, env: Env) {
         const lines: string[] = ['📦 Indexed Repositories\n']
 
         if (Array.isArray(repoData) && repoData.length > 0) {
-          // Deduplicate by name (GitNexus may return multiple entries per repo)
+          // Deduplicate by name
           const seen = new Map<string, typeof repoData[0]>()
           for (const repo of repoData) {
             const name = typeof repo === 'string' ? repo : (repo.name ?? repo.repo ?? 'unknown')
@@ -411,17 +411,18 @@ export function registerCodeTools(server: McpServer, env: Env) {
             }
           }
 
-          // Format as clean table
-          lines.push('| # | Repository | Project ID | Symbols |')
-          lines.push('|---|-----------|-----------|---------|')
+          // Format as clean table with all useful columns
+          lines.push('| # | Name | Slug (use with `repo:`) | Symbols | Flows |')
+          lines.push('|---|------|------------------------|---------|-------|')
 
           let idx = 0
           for (const [, repo] of seen) {
             idx++
             const name = typeof repo === 'string' ? repo : (repo.name ?? 'unknown')
-            const pid = repo.projectId ?? repo.project_id ?? '(auto)'
-            const symbols = repo.symbols ?? repo.symbol_count ?? '?'
-            lines.push(`| ${idx} | **${name}** | \`${pid}\` | ${symbols} |`)
+            const slug = repo.slug ?? name
+            const symbols = repo.symbols ?? '?'
+            const flows = repo.flows ?? '?'
+            lines.push(`| ${idx} | **${name}** | \`${slug}\` | ${symbols} | ${flows} |`)
           }
 
           lines.push('')
@@ -430,7 +431,11 @@ export function registerCodeTools(server: McpServer, env: Env) {
           lines.push('No indexed repositories found.')
         }
 
-        lines.push('\n💡 Pass the `Project ID` to cortex_code_search, cortex_code_context, cortex_code_impact, or cortex_cypher.')
+        lines.push('')
+        lines.push('💡 **Usage**: Pass the Name or Slug directly to the `repo` parameter:')
+        lines.push('  `cortex_code_search(query: "...", repo: "cortex-hub")`')
+        lines.push('  `cortex_code_context(name: "MyClass", repo: "YulgangProject")`')
+        lines.push('  No need to use `projectId` — just use the repo name.')
 
         return {
           content: [{ type: 'text' as const, text: lines.join('\n') }],
