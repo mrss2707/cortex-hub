@@ -34,31 +34,44 @@ async function getPipeline(modelId: string): Promise<FeatureExtractionPipeline> 
   }
 
   currentModelId = modelId
-  loadPromise = (async () => {
+  const promise = (async () => {
     // Dynamic import — keeps @huggingface/transformers as an optional runtime dep.
     // We use @huggingface/transformers (v4+) instead of @xenova/transformers
     // because the newer package drops the eager `sharp` dependency that broke
     // text-only Linux deployments.
     const transformers = await import('@huggingface/transformers') as {
       pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<FeatureExtractionPipeline>
-      env?: { allowLocalModels?: boolean; useBrowserCache?: boolean }
+      env?: { allowLocalModels?: boolean; useBrowserCache?: boolean; useFSCache?: boolean }
     }
 
     if (transformers.env) {
       transformers.env.allowLocalModels = false
       transformers.env.useBrowserCache = false
+      transformers.env.useFSCache = true
     }
 
     const pipe = await transformers.pipeline('feature-extraction', modelId, {
       // dtype 'q8' = 8-bit quantized — smaller download, faster, slight precision loss
       dtype: 'q8',
     })
-    pipelineSingleton = pipe
-    loadPromise = null
     return pipe
   })()
 
-  return loadPromise
+  loadPromise = promise
+
+  // CRITICAL: clear cached state on failure so the next call retries fresh
+  // (otherwise a single transient error poisons the singleton forever)
+  promise
+    .then((pipe) => {
+      pipelineSingleton = pipe
+      loadPromise = null
+    })
+    .catch(() => {
+      currentModelId = null
+      loadPromise = null
+    })
+
+  return promise
 }
 
 /**
