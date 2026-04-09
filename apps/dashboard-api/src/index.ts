@@ -137,16 +137,21 @@ try {
 // The first cold-load downloads ~25MB and can take 5-10s. Doing it at
 // startup avoids the first API request hanging or timing out.
 if (process.env['EMBEDDING_PROVIDER'] === 'local') {
-  void (async () => {
-    try {
-      const t0 = Date.now()
-      const { embedLocal } = await import('@cortex/shared-mem9')
-      const model = process.env['LOCAL_EMBEDDING_MODEL'] || 'Xenova/all-MiniLM-L6-v2'
-      logger.info(`[embed] Pre-warming local model: ${model}`)
-      await embedLocal('warmup', model)
-      logger.info(`[embed] Local model ready in ${Date.now() - t0}ms`)
-    } catch (e) {
-      logger.error(`[embed] Local pre-warm FAILED: ${(e as Error).message}`)
-    }
-  })()
+  // Defer to next tick so it doesn't block startup logs
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const t0 = Date.now()
+        logger.info('[embed] Importing @cortex/shared-mem9...')
+        const { embedLocal } = await import('@cortex/shared-mem9')
+        const model = process.env['LOCAL_EMBEDDING_MODEL'] || 'Xenova/all-MiniLM-L6-v2'
+        logger.info(`[embed] Pre-warming local model: ${model}`)
+        const v = await embedLocal('warmup', model)
+        logger.info(`[embed] Local model ready in ${Date.now() - t0}ms (dim=${v.length})`)
+      } catch (e) {
+        const err = e as Error
+        logger.error(`[embed] Local pre-warm FAILED: ${err.message}\n${err.stack?.slice(0, 2000)}`)
+      }
+    })()
+  }, 500)
 }
