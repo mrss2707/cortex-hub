@@ -441,6 +441,39 @@ knowledgeRouter.delete('/:id', async (c) => {
 })
 
 // ── POST /search — Vector search with metadata ──
+// ── Hybrid re-ranking helpers ────────────────────────────────────────
+// Tiny English stopword list — empirically chosen, kept short to avoid
+// stripping meaningful terms in code/conversation queries.
+const STOPWORDS = new Set([
+  'the','a','an','and','or','but','in','on','at','to','for','of','with','by',
+  'is','was','are','were','be','been','being','have','has','had','do','does','did',
+  'i','you','he','she','it','we','they','them','this','that','these','those',
+  'what','when','where','who','why','how','can','could','would','should','will',
+  'my','your','his','her','its','our','their','me','him','us',
+])
+
+function tokenize(text: string): string[] {
+  return text.toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && !STOPWORDS.has(t))
+}
+
+/**
+ * Lexical match score — fraction of query tokens that appear in content.
+ * Cheap (~50us per call), correlates strongly with relevance for keyword
+ * questions. Used as a re-ranking signal alongside vector similarity.
+ */
+function lexicalScore(queryTokens: string[], content: string): number {
+  if (queryTokens.length === 0) return 0
+  const contentLower = content.toLowerCase()
+  let matches = 0
+  for (const token of queryTokens) {
+    if (contentLower.includes(token)) matches++
+  }
+  return matches / queryTokens.length
+}
+
 knowledgeRouter.post('/search', async (c) => {
   try {
     const body = await c.req.json()
@@ -470,13 +503,16 @@ knowledgeRouter.post('/search', async (c) => {
     }
 
     const searchLimit = limit ?? 10
+    // Overfetch for hybrid re-ranking — we score lexical + quality on more
+    // candidates than the user asked for, then trim to searchLimit.
+    const fetchLimit = Math.max(searchLimit * 3, 30)
 
     const res = await fetch(`${QDRANT_URL}/collections/${COLLECTION}/points/search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         vector,
-        limit: searchLimit,
+        limit: fetchLimit,
         with_payload: true,
         filter: must.length > 0 ? { must } : undefined,
       }),
@@ -515,12 +551,15 @@ knowledgeRouter.post('/search', async (c) => {
       ).run(...docIds)
     }
 
-    // Join document metadata + quality metrics, then re-rank
+    // Pre-tokenize query once for lexical scoring
+    const queryTokens = tokenize(query)
+
+    // Join document metadata + quality metrics + lexical, then re-rank
     const now = Date.now()
     const enriched = results.map((r) => {
       if (!r.documentId) return r
       const doc = db.prepare(
-        `SELECT id, title, tags, project_id, source, hit_count, status,
+        `SELECT id, title, tags, project_id, source, hit_count, status, content_preview,
                 selection_count, applied_count, completion_count, fallback_count,
                 origin, category, generation, created_by_agent, updated_at,
                 hall_type, valid_from, invalidated_at, superseded_by
@@ -553,17 +592,32 @@ knowledgeRouter.post('/search', async (c) => {
         fallbackRate: sel > 0 ? fall / sel : 0,
       }
 
-      // Hybrid score: vector_similarity * 0.6 + effective_rate * 0.3 + recency * 0.1
+      // Compute lexical score against title + chunk content + content_preview
+      // (chunk content is the actual matched text from Qdrant payload)
+      const lexicalCorpus = [
+        String(doc.title ?? ''),
+        String(r.content ?? ''),
+        String(doc.content_preview ?? ''),
+      ].join(' ')
+      const lex = lexicalScore(queryTokens, lexicalCorpus)
+
+      // Recency decay over 90 days
       const updatedAt = doc.updated_at ? new Date(doc.updated_at as string).getTime() : 0
       const daysSinceUpdate = Math.max(0, (now - updatedAt) / (1000 * 60 * 60 * 24))
-      const recencyScore = Math.max(0, 1 - daysSinceUpdate / 90) // decay over 90 days
+      const recencyScore = Math.max(0, 1 - daysSinceUpdate / 90)
       const vectorScore = r.score
 
-      let hybridScore = vectorScore
-      if (sel >= 3) {
-        // Only apply quality ranking once we have enough data
-        hybridScore = vectorScore * 0.6 + quality.effectiveRate * 0.3 + recencyScore * 0.1
-      }
+      // Hybrid weighting:
+      //   vector  × 0.55  (semantic match — primary signal)
+      //   lexical × 0.35  (keyword overlap — boosts exact matches)
+      //   quality × 0.05  (only meaningful when sel >= 3, otherwise 0)
+      //   recency × 0.05
+      const qualityBonus = sel >= 3 ? quality.effectiveRate : 0
+      const hybridScore =
+        vectorScore * 0.55 +
+        lex * 0.35 +
+        qualityBonus * 0.05 +
+        recencyScore * 0.05
 
       // Flag high-fallback docs
       const deprecated = sel >= 5 && quality.fallbackRate > 0.5
@@ -571,6 +625,8 @@ knowledgeRouter.post('/search', async (c) => {
       return {
         ...r,
         score: hybridScore,
+        vectorScore,
+        lexicalScore: lex,
         quality,
         origin: doc.origin,
         category: doc.category,
@@ -579,11 +635,12 @@ knowledgeRouter.post('/search', async (c) => {
       }
     })
 
-    // Drop entries filtered out by hallType/asOf, then re-sort by hybrid score
+    // Drop entries filtered out by hallType/asOf, re-sort, take top searchLimit
     const filtered = enriched.filter((r): r is NonNullable<typeof r> => r !== null)
     filtered.sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    const trimmed = filtered.slice(0, searchLimit)
 
-    return c.json({ query, results: filtered })
+    return c.json({ query, results: trimmed })
   } catch (error) {
     logger.error(`Knowledge search failed: ${String(error)}`)
     return c.json({ error: String(error) }, 500)
