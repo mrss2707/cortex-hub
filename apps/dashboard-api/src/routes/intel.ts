@@ -372,39 +372,63 @@ intelRouter.post('/search', async (c) => {
       // ── Fallback: cypher symbol search if flow search found nothing ──
       if (scoredHits.length === 0) {
         logger.info(`Code search: 0 flow matches, falling back to cypher symbol search`)
-        // Extract main keyword (longest word > 3 chars)
-        const keywords = query.split(/\s+/).filter(w => w.length > 3).sort((a, b) => b.length - a.length)
-        const mainKeyword = keywords[0] ?? query
-        const cypherQuery = `MATCH (n) WHERE n.name CONTAINS "${mainKeyword}" RETURN n.name as name, labels(n) as labels, n.filePath as file LIMIT 10`
+        // Extract ALL meaningful keywords (3+ chars), preserve order
+        const keywords = query.split(/\s+/).filter(w => w.length >= 3)
+        if (keywords.length === 0) keywords.push(query)
+
+        // Build OR cypher: match any keyword (case-insensitive)
+        const conditions = keywords.map(k => `toLower(n.name) CONTAINS toLower("${k.replace(/"/g, '\\"')}")`).join(' OR ')
+        const cypherQuery = `MATCH (n) WHERE ${conditions} RETURN n.name as name, labels(n) as labels, n.filePath as file LIMIT 30`
+
+        // Helper: parse GitNexus cypher response (rows OR markdown table)
+        const parseCypherRows = (r: Record<string, unknown>): Array<{ name: string; type: string; file: string }> => {
+          const rows = (r?.rows ?? r?.results ?? r?.data) as Array<Record<string, unknown>> | undefined
+          if (Array.isArray(rows) && rows.length > 0) {
+            return rows.map(row => ({
+              name: String(row.name ?? '?'),
+              type: Array.isArray(row.labels) ? row.labels.join(',') : String(row.labels ?? ''),
+              file: String(row.file ?? ''),
+            }))
+          }
+          // Parse markdown table from { markdown: "| name | labels | file |\n| --- | ... |\n| val | val | val |" }
+          const md = (r?.markdown as string) ?? ''
+          if (md && md.includes('|')) {
+            const lines = md.split('\n').filter(l => l.includes('|') && !l.match(/^\|\s*-+/))
+            const dataLines = lines.slice(1) // skip header
+            return dataLines.map(l => {
+              const cells = l.split('|').map(c => c.trim()).filter(c => c.length > 0)
+              return { name: cells[0] ?? '?', type: cells[1] ?? '', file: cells[2] ?? '' }
+            }).filter(x => x.name !== '?')
+          }
+          return []
+        }
+
+        // Score: count how many keywords appear in the symbol name (case-insensitive)
+        const scoreSymbol = (name: string): number => {
+          const lower = name.toLowerCase()
+          return keywords.filter(k => lower.includes(k.toLowerCase())).length
+        }
 
         for (let i = 0; i < allProjects.length; i += CONCURRENCY) {
           const batch = allProjects.slice(i, i + CONCURRENCY)
           const batchResults = await Promise.allSettled(
             batch.map(async (p) => {
               const candidates = resolveRepoNames(p.id)
+              let lastErr: unknown = null
               for (const candidate of candidates) {
                 try {
                   const r = await callGitNexus('cypher', { query: cypherQuery, repo: candidate }) as Record<string, unknown>
-                  // GitNexus cypher response: { rows: [...] } or { results: [...] } or raw text
-                  const rows = (r?.rows ?? r?.results ?? r?.data) as Array<Record<string, unknown>> | undefined
-                  if (Array.isArray(rows) && rows.length > 0) {
-                    return {
-                      project: p,
-                      symbols: rows.slice(0, 10).map(row => ({
-                        name: String(row.name ?? '?'),
-                        type: Array.isArray(row.labels) ? row.labels.join(',') : String(row.labels ?? ''),
-                        file: String(row.file ?? ''),
-                      })),
-                      count: rows.length,
-                    }
+                  const symbols = parseCypherRows(r)
+                  if (symbols.length > 0) {
+                    const scored = symbols
+                      .map(s => ({ ...s, relevance: scoreSymbol(s.name) }))
+                      .sort((a, b) => b.relevance - a.relevance)
+                    const totalScore = scored.reduce((sum, s) => sum + s.relevance, 0)
+                    return { project: p, symbols: scored.slice(0, 10), count: symbols.length, score: totalScore }
                   }
-                  // Try parsing raw text response too
-                  const raw = (r?.raw as string) ?? ''
-                  if (raw && !raw.includes('error') && raw.includes(mainKeyword)) {
-                    return { project: p, symbols: [], count: 1, raw }
-                  }
-                } catch { /* try next */ }
+                } catch (e) { lastErr = e }
               }
+              if (lastErr) logger.debug(`Cypher search failed for ${p.id}: ${String(lastErr).slice(0, 100)}`)
               return null
             })
           )
@@ -412,8 +436,8 @@ intelRouter.post('/search', async (c) => {
             if (r.status === 'fulfilled' && r.value) {
               scoredHits.push({
                 project: r.value.project,
-                result: { cypher: true, symbols: r.value.symbols, raw: (r.value as { raw?: string }).raw },
-                score: r.value.count,
+                result: { cypher: true, symbols: r.value.symbols },
+                score: r.value.score,
                 symbols: r.value.symbols,
                 via: 'symbol' as const,
               })
