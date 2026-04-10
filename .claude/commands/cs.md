@@ -1,6 +1,7 @@
-# /cs — Cortex Start v2.0
+# /cs — Cortex Start v2.1
 
-> Version: 2.0 | Updated: 2026-04-06
+> Version: 2.1 | Updated: 2026-04-04
+> Changelog: v2.1 — added plan quality gate before implementation
 > Changelog: v2.0 — added task pickup, detect changes, recipe health, workflow recipes, versioning
 
 Run ALL steps IN ORDER. Do NOT skip. Do NOT proceed to user work until Step 8 completes.
@@ -55,6 +56,13 @@ Print a concise report:
 
 ## Step 8: Activate Workflow Intelligence
 For the REST of this session, follow these tool combos automatically:
+
+### Before implementing ANY plan:
+1. Draft plan with steps + files to change
+2. `cortex_plan_quality(plan: "<your plan>")` → score 0-100
+3. If score < 60 → refine plan (re-check assumptions, missing steps)
+4. If score 60-80 → proceed with caution, note weak areas
+5. If score > 80 → execute
 
 ### Before editing ANY file:
 1. `cortex_code_search(query: "<what you're looking for>")` — find relevant code

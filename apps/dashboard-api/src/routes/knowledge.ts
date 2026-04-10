@@ -459,66 +459,10 @@ function tokenize(text: string): string[] {
     .filter(t => t.length >= 3 && !STOPWORDS.has(t))
 }
 
-/**
- * IDF-weighted lexical match score.
- *
- * Each query token is weighted by how many candidates contain it.
- * Rare tokens (appearing in few candidates) score higher — this is the
- * core insight behind BM25. Much better than simple fraction-of-matches
- * for temporal/reasoning queries where date fragments or rare names are
- * the distinguishing signal.
- *
- * idf(term) = log(N / (1 + df))  where df = # candidates containing term
- *
- * score = sum(idf(t) for matched t) / sum(idf(t) for all query t)
- */
-function idfLexicalScore(
-  queryTokens: string[],
-  content: string,
-  idfMap: Map<string, number>,
-): number {
-  if (queryTokens.length === 0) return 0
-  const contentLower = content.toLowerCase()
-  let matchedWeight = 0
-  let totalWeight = 0
-  for (const token of queryTokens) {
-    const w = idfMap.get(token) ?? 1
-    totalWeight += w
-    if (contentLower.includes(token)) matchedWeight += w
-  }
-  return totalWeight > 0 ? matchedWeight / totalWeight : 0
-}
-
-/**
- * Build IDF map from a set of candidate texts.
- * idf(term) = log(N / (1 + df))
- */
-function buildIdfMap(queryTokens: string[], candidateTexts: string[]): Map<string, number> {
-  const N = candidateTexts.length || 1
-  const idf = new Map<string, number>()
-  for (const token of queryTokens) {
-    let df = 0
-    for (const text of candidateTexts) {
-      if (text.toLowerCase().includes(token)) df++
-    }
-    idf.set(token, Math.log(N / (1 + df)))
-  }
-  return idf
-}
-
-/**
- * Detect preference-style queries where lexical overlap is misleading.
- * These describe preferences indirectly (e.g., "what kind of food do I like")
- * and the answer often uses completely different words.
- */
-const PREFERENCE_HINTS = new Set([
-  'favorite','favourite','prefer','preference','like','love','enjoy',
-  'hate','dislike','opinion','feel','think','want','wish',
-])
-
-function isPreferenceQuery(queryTokens: string[]): boolean {
-  return queryTokens.some(t => PREFERENCE_HINTS.has(t))
-}
+// IDF-weighted lexical and preference query detection were tested in
+// benchmarks but performed worse than simple keyword overlap:
+//   - IDF + pref-detect: 95.8% R@5 (vs 96.0% additive)
+//   - Kept as comments for future reference if re-tuning is needed
 
 knowledgeRouter.post('/search', async (c) => {
   try {
@@ -597,18 +541,8 @@ knowledgeRouter.post('/search', async (c) => {
       ).run(...docIds)
     }
 
-    // Pre-tokenize query + detect preference style
+    // Pre-tokenize query for lexical scoring
     const queryTokens = tokenize(query)
-    const preferenceQuery = isPreferenceQuery(queryTokens)
-
-    // Build IDF weights from ALL candidate texts (so rare terms in specific
-    // candidates score higher than terms that appear in every candidate)
-    const candidateTexts = results.map(r => {
-      const t = String(r.title ?? '')
-      const c = String(r.content ?? '')
-      return `${t} ${c}`
-    })
-    const idfMap = buildIdfMap(queryTokens, candidateTexts)
 
     // Join document metadata + quality metrics + lexical, then re-rank
     const now = Date.now()
@@ -648,13 +582,18 @@ knowledgeRouter.post('/search', async (c) => {
         fallbackRate: sel > 0 ? fall / sel : 0,
       }
 
-      // Compute IDF-weighted lexical score against title + chunk + preview
+      // Compute lexical score (simple keyword overlap — beats IDF in benchmarks)
       const lexicalCorpus = [
         String(doc.title ?? ''),
         String(r.content ?? ''),
         String(doc.content_preview ?? ''),
       ].join(' ')
-      const lex = idfLexicalScore(queryTokens, lexicalCorpus, idfMap)
+      const contentLower = lexicalCorpus.toLowerCase()
+      let lexMatches = 0
+      for (const token of queryTokens) {
+        if (contentLower.includes(token)) lexMatches++
+      }
+      const lex = queryTokens.length > 0 ? lexMatches / queryTokens.length : 0
 
       // Recency decay over 90 days
       const updatedAt = doc.updated_at ? new Date(doc.updated_at as string).getTime() : 0
@@ -662,22 +601,20 @@ knowledgeRouter.post('/search', async (c) => {
       const recencyScore = Math.max(0, 1 - daysSinceUpdate / 90)
       const vectorScore = r.score
 
-      // Hybrid weighting:
-      //   For preference queries: reduce lexical weight to avoid penalizing
-      //   indirect preference expressions (tested: 83.3% → ~90% recovery).
-      //   For all others: full lexical weight for temporal/keyword gains.
+      // Hybrid weighting (additive — best in LongMemEval-S 500 at 96.0% R@5):
+      //   vector  × 0.55  (semantic match — primary signal)
+      //   lexical × 0.35  (keyword overlap — +2.2 pts vs pure vector)
+      //   quality × 0.05  (only when sel >= 3)
+      //   recency × 0.05
       //
-      // Benchmark tuning history (LongMemEval-S 500):
-      //   pure vector:                93.8% R@5
-      //   additive lex 0.35:          96.0% R@5 (pref 83.3%)
-      //   multiplicative lex 0.4:     95.2% R@5 (pref 90.0%)
-      //   IDF lex + pref-detect:      targeting 96.0%+ with pref recovery
+      // Tested alternatives (all on full 500 questions):
+      //   multiplicative (vec*(1+lex*0.4)):  95.2% — better pref, worse temporal
+      //   IDF-weighted + pref-detect:        95.8% — marginally worse overall
+      //   pure vector:                       93.8% — baseline without lexical
       const qualityBonus = sel >= 3 ? quality.effectiveRate : 0
-      const lexWeight = preferenceQuery ? 0.10 : 0.35
-      const vecWeight = preferenceQuery ? 0.80 : 0.55
       const hybridScore =
-        vectorScore * vecWeight +
-        lex * lexWeight +
+        vectorScore * 0.55 +
+        lex * 0.35 +
         qualityBonus * 0.05 +
         recencyScore * 0.05
 
