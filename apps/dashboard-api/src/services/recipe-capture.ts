@@ -74,24 +74,9 @@ function chunkText(text: string): string[] {
   return chunks
 }
 
-function resolveGeminiApiKey(): string {
-  const envKey = process.env['GEMINI_API_KEY']
-  if (envKey) return envKey
-  try {
-    const row = db.prepare(
-      "SELECT api_key FROM provider_accounts WHERE type = 'gemini' AND status = 'enabled' AND api_key IS NOT NULL LIMIT 1"
-    ).get() as { api_key: string } | undefined
-    if (row?.api_key) return row.api_key
-  } catch { /* DB might not be ready */ }
-  return ''
-}
-
 function getEmbedder(): Embedder {
-  return new Embedder({
-    provider: 'gemini' as const,
-    apiKey: resolveGeminiApiKey(),
-    model: process.env['MEM9_EMBEDDING_MODEL'] || 'gemini-embedding-exp-03-07',
-  } satisfies EmbedderConfig)
+  const { createEmbedder } = require('../lib/embedder-factory.js') as { createEmbedder: () => Embedder }
+  return createEmbedder()
 }
 
 function getVectorStore(): VectorStore {
