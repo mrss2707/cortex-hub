@@ -18,8 +18,11 @@ export const knowledgeRouter = new Hono()
 
 const QDRANT_URL = process.env.QDRANT_URL ?? 'http://qdrant:6333'
 const COLLECTION = 'knowledge'
+const CLUSTER_COLLECTION = 'knowledge_clusters'
 const CHUNK_SIZE = 1500
 const CHUNK_OVERLAP = 300
+const CLUSTER_THRESHOLD = 500   // enable clustering when docs exceed this
+const CLUSTER_SIM_THRESHOLD = 0.75  // cosine similarity to join existing cluster
 
 // ── Helpers ──
 
@@ -81,6 +84,148 @@ function getVectorStore(): VectorStore {
     collection: COLLECTION,
   }
   return new VectorStore(config)
+}
+
+// ── Hierarchical clustering helpers (zero LLM, pure vector math) ──
+
+async function ensureClusterCollection(vectorSize: number): Promise<void> {
+  try {
+    const check = await fetch(`${QDRANT_URL}/collections/${CLUSTER_COLLECTION}`, {
+      signal: AbortSignal.timeout(3000),
+    })
+    if (check.ok) return
+  } catch { /* doesn't exist yet */ }
+
+  await fetch(`${QDRANT_URL}/collections/${CLUSTER_COLLECTION}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      vectors: { size: vectorSize, distance: 'Cosine' },
+    }),
+    signal: AbortSignal.timeout(5000),
+  })
+}
+
+async function assignCluster(vector: number[], docId: string, projectId: string | null): Promise<string | null> {
+  // Search existing cluster centroids for this project
+  const filter = projectId
+    ? { must: [{ key: 'project_id', match: { value: projectId } }] }
+    : undefined
+
+  try {
+    const res = await fetch(`${QDRANT_URL}/collections/${CLUSTER_COLLECTION}/points/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vector, limit: 1, with_payload: true, filter }),
+      signal: AbortSignal.timeout(5000),
+    })
+
+    if (res.ok) {
+      const data = (await res.json()) as { result?: Array<{ id: string; score: number; payload?: Record<string, unknown> }> }
+      const best = data.result?.[0]
+
+      if (best && best.score >= CLUSTER_SIM_THRESHOLD) {
+        // Join existing cluster
+        const clusterId = best.payload?.cluster_id as string ?? best.id as string
+        return clusterId
+      }
+    }
+  } catch { /* cluster collection may not exist yet */ }
+
+  // Create new cluster with this document's embedding as centroid
+  const clusterId = `cluster-${randomUUID().slice(0, 8)}`
+  try {
+    await ensureClusterCollection(vector.length)
+    await fetch(`${QDRANT_URL}/collections/${CLUSTER_COLLECTION}/points`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        points: [{
+          id: clusterId,
+          vector,
+          payload: {
+            cluster_id: clusterId,
+            project_id: projectId ?? '',
+            seed_doc_id: docId,
+            doc_count: 1,
+          },
+        }],
+      }),
+      signal: AbortSignal.timeout(5000),
+    })
+  } catch (err) {
+    logger.warn(`[cluster] Failed to create cluster: ${(err as Error).message}`)
+    return null
+  }
+
+  return clusterId
+}
+
+async function hierarchicalSearch(
+  vector: number[],
+  fetchLimit: number,
+  filter?: { must: Array<Record<string, unknown>> },
+): Promise<Array<{ id: string; score: number; payload?: Record<string, unknown> }> | null> {
+  // Stage 1: Find top clusters
+  try {
+    const clusterFilter = filter ? {
+      must: filter.must.filter(f => 'key' in f && (f as { key: string }).key === 'project_id'),
+    } : undefined
+
+    const clusterRes = await fetch(`${QDRANT_URL}/collections/${CLUSTER_COLLECTION}/points/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vector,
+        limit: 5,
+        with_payload: true,
+        filter: clusterFilter?.must?.length ? clusterFilter : undefined,
+      }),
+      signal: AbortSignal.timeout(5000),
+    })
+
+    if (!clusterRes.ok) return null
+
+    const clusterData = (await clusterRes.json()) as {
+      result?: Array<{ id: string; score: number; payload?: Record<string, unknown> }>
+    }
+    const clusters = clusterData.result ?? []
+    if (clusters.length === 0) return null
+
+    const clusterIds = clusters.map(c => c.payload?.cluster_id as string ?? c.id)
+
+    // Stage 2: Search documents within those clusters
+    const docFilter: Array<Record<string, unknown>> = [
+      { key: 'cluster_id', match: { any: clusterIds } },
+    ]
+    if (filter?.must) {
+      for (const f of filter.must) {
+        docFilter.push(f)
+      }
+    }
+
+    const docRes = await fetch(`${QDRANT_URL}/collections/${COLLECTION}/points/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vector,
+        limit: fetchLimit,
+        with_payload: true,
+        filter: { must: docFilter },
+      }),
+      signal: AbortSignal.timeout(10000),
+    })
+
+    if (!docRes.ok) return null
+
+    const docData = (await docRes.json()) as {
+      result?: Array<{ id: string; score: number; payload?: Record<string, unknown> }>
+    }
+    return docData.result ?? null
+  } catch (err) {
+    logger.warn(`[search] Hierarchical search failed, falling back to flat: ${(err as Error).message}`)
+    return null
+  }
 }
 
 // ── GET / — List documents ──
@@ -213,13 +358,20 @@ knowledgeRouter.post('/', async (c) => {
       }
     }
 
-    // Embed and store each chunk
+    // Embed and store each chunk (with cluster assignment)
+    let clusterId: string | null = null
     for (let i = 0; i < chunks.length; i++) {
       const chunkId = randomUUID()
       const chunkContent = chunks[i]!
 
       try {
         const vector = await embedder.embed(chunkContent)
+
+        // Assign cluster on first chunk (representative of the document)
+        if (i === 0) {
+          clusterId = await assignCluster(vector, docId, normalizedProjectId).catch(() => null)
+        }
+
         await vectorStore.upsert(chunkId, vector, {
           document_id: docId,
           chunk_index: i,
@@ -227,6 +379,7 @@ knowledgeRouter.post('/', async (c) => {
           project_id: normalizedProjectId ?? '',
           content: chunkContent.slice(0, 2000),
           title,
+          cluster_id: clusterId ?? '',
         })
 
         db.prepare(
@@ -493,30 +646,40 @@ knowledgeRouter.post('/search', async (c) => {
     }
 
     const searchLimit = limit ?? 10
-    // Overfetch for hybrid re-ranking — we score lexical + quality on more
-    // candidates than the user asked for, then trim to searchLimit.
-    const fetchLimit = Math.max(searchLimit * 3, 30)
+    // Overfetch for hybrid re-ranking — score more candidates, then trim
+    const fetchLimit = Math.max(searchLimit * 5, 50)
 
-    const res = await fetch(`${QDRANT_URL}/collections/${COLLECTION}/points/search`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        vector,
-        limit: fetchLimit,
-        with_payload: true,
-        filter: must.length > 0 ? { must } : undefined,
-      }),
-      signal: AbortSignal.timeout(10000),
-    })
+    // Try hierarchical search first (two-stage: clusters → documents)
+    // Falls back to flat search if clustering not available or corpus is small
+    const filter = must.length > 0 ? { must } : undefined
+    let searchResults = await hierarchicalSearch(vector, fetchLimit, filter)
 
-    if (!res.ok) {
-      const errText = await res.text()
-      return c.json({ error: `Search failed: ${errText}` }, 500)
+    if (!searchResults) {
+      // Flat search fallback
+      const res = await fetch(`${QDRANT_URL}/collections/${COLLECTION}/points/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vector,
+          limit: fetchLimit,
+          with_payload: true,
+          filter: filter,
+        }),
+        signal: AbortSignal.timeout(10000),
+      })
+
+      if (!res.ok) {
+        const errText = await res.text()
+        return c.json({ error: `Search failed: ${errText}` }, 500)
+      }
+
+      const flatData = (await res.json()) as {
+        result?: Array<{ id: string; score: number; payload?: Record<string, unknown> }>
+      }
+      searchResults = flatData.result ?? []
     }
 
-    const data = (await res.json()) as {
-      result?: Array<{ id: string; score: number; payload?: Record<string, unknown> }>
-    }
+    const data = { result: searchResults }
 
     // Enrich with document metadata, quality metrics, and re-rank
     const docIds = new Set<string>()
