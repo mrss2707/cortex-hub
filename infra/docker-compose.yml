@@ -50,7 +50,7 @@ services:
       - ./cliproxy-config.yaml:/CLIProxyAPI/config.yaml
     environment:
       TZ: Asia/Ho_Chi_Minh
-      MANAGEMENT_PASSWORD: ${MANAGEMENT_PASSWORD:-cortex2026}
+      MANAGEMENT_PASSWORD: ${MANAGEMENT_PASSWORD:?Set MANAGEMENT_PASSWORD in .env}
     deploy:
       resources:
         limits:
@@ -112,7 +112,7 @@ services:
       - api-data:/app/data
       - gitnexus-data:/root/.gitnexus
       - cliproxy-auth:/app/cliproxy-auth
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Docker socket removed — security risk (root access if API compromised)
     environment:
       TZ: Asia/Ho_Chi_Minh
       PORT: 4000
@@ -123,7 +123,7 @@ services:
       OPENAI_API_BASE: http://llm-proxy:8317/v1
       LLM_PROXY_URL: http://llm-proxy:8317
       CLIPROXY_AUTH_DIR: /app/cliproxy-auth
-      CLIPROXY_MANAGEMENT_KEY: ${MANAGEMENT_PASSWORD:-cortex2026}
+      CLIPROXY_MANAGEMENT_KEY: ${MANAGEMENT_PASSWORD:?Set MANAGEMENT_PASSWORD in .env}
       DASHBOARD_URL: ${DASHBOARD_URL:-https://hub.jackle.dev}
       # mem9 Configuration
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}

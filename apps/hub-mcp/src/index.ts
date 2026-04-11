@@ -38,6 +38,8 @@ app.use('*', async (c, next) => {
   await next()
 })
 
+// MCP server requires open CORS — agents connect from any IDE/origin
+// Security is enforced via API key auth, not CORS
 app.use('*', cors())
 app.use('*', logger())
 

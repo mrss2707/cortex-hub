@@ -35,7 +35,19 @@ import { settingsRouter } from './routes/settings.js'
 const app = new Hono()
 const logger = createLogger('dashboard-api')
 
-app.use('*', cors())
+app.use('*', cors({
+  origin: (origin) => {
+    // Allow same-origin, localhost dev, and configured dashboard URL
+    const allowed = [
+      /^https?:\/\/localhost(:\d+)?$/,
+      /^https?:\/\/127\.0\.0\.1(:\d+)?$/,
+    ]
+    const dashboardUrl = process.env['DASHBOARD_URL']
+    if (dashboardUrl) allowed.push(new RegExp(`^${dashboardUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`))
+    if (!origin || allowed.some(re => re.test(origin))) return origin
+    return null  // block unknown origins
+  },
+}))
 app.use('*', honoLogger())
 
 app.get('/health', async (c) => {
