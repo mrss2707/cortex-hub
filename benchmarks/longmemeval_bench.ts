@@ -649,7 +649,7 @@ function renderMarkdown(summary: BenchSummary): string {
   lines.push(`- **API**: ${summary.apiUrl}`)
   lines.push(`- **Project**: ${summary.projectId}`)
   lines.push(`- **Questions scored**: ${summary.scoredQuestions} / ${summary.totalQuestions}`)
-  lines.push(`- **Duration**: ${(summary.durationMs / 1000).toFixed(1)}s`)
+  lines.push(`- **Search duration**: ${(summary.durationMs / 1000).toFixed(1)}s (query-only, excludes one-time import)`)
   lines.push('')
   lines.push('| Metric | Cortex Hub | MemPalace baseline |')
   lines.push('| --- | --- | --- |')
@@ -714,67 +714,80 @@ async function run(): Promise<number> {
   const questions = await loadQuestions(opts.limit, opts.offset, opts.stratified)
   log(`Loaded ${questions.length} question(s) from dataset (${formatBytes(datasetSize)})`)
 
-  const outcomes: QuestionOutcome[] = []
-  const notes: string[] = []
-  const startedAt = Date.now()
+  // ── Phase 1: Import ALL unique sessions into one project (one-time) ──
+  // This mirrors real Cortex usage: index once, query many times.
+  const globalDocMap = new Map<string, string>() // sessionId → docId
+  let totalImportFailures = 0
+  let importDurationMs = 0
 
-  for (let qi = 0; qi < questions.length; qi++) {
-    const q = questions[qi] as NormalisedQuestion
-    const progress = `[${qi + 1}/${questions.length}] ${q.questionId}`
-
-    const docIdBySessionId = new Map<string, string>()
-    let importFailures = 0
-    let importLatencyMs = 0
-    const importStart = Date.now()
-
-    if (!opts.skipImport) {
-      // Parallel import with concurrency limit (Gemini embedding API allows ~10 concurrent)
-      const CONCURRENCY = 10
-      for (let i = 0; i < q.sessions.length; i += CONCURRENCY) {
-        const batch = q.sessions.slice(i, i + CONCURRENCY)
-        const results = await Promise.allSettled(
-          batch.map(session => importSession(opts.apiUrl, session).then(docId => ({ session, docId }))),
-        )
-        for (const r of results) {
-          if (r.status === 'fulfilled') {
-            docIdBySessionId.set(r.value.session.sessionId, r.value.docId)
-          } else {
-            importFailures++
-            if (opts.verbose) {
-              log(`  ! import failed: ${(r.reason as Error).message}`)
-            }
-          }
+  if (!opts.skipImport) {
+    // Collect all unique sessions across all questions
+    const uniqueSessions = new Map<string, NormalisedSession>()
+    for (const q of questions) {
+      for (const s of q.sessions) {
+        if (!uniqueSessions.has(s.sessionId)) {
+          uniqueSessions.set(s.sessionId, s)
         }
       }
     }
-    importLatencyMs = Date.now() - importStart
 
-    if (docIdBySessionId.size === 0 && !opts.skipImport) {
-      log(`${progress} — SKIPPED (no sessions imported)`)
-      outcomes.push({
-        questionId: q.questionId,
-        questionType: q.questionType,
-        goldSessionIds: q.goldSessionIds,
-        topDocIds: [],
-        hitRank: null,
-        r_at_5: 0,
-        r_at_10: 0,
-        ndcg_at_10: 0,
-        importedDocs: 0,
-        importFailures,
-        searchLatencyMs: 0,
-        importLatencyMs,
-        note: 'import_failed',
-      })
-      continue
+    const allSessions = [...uniqueSessions.values()]
+    log(`\n── Phase 1: Import ──`)
+    log(`Importing ${allSessions.length} unique sessions into project "${BENCH_PROJECT_ID}" ...`)
+
+    const importStart = Date.now()
+    const CONCURRENCY = 10
+    for (let i = 0; i < allSessions.length; i += CONCURRENCY) {
+      const batch = allSessions.slice(i, i + CONCURRENCY)
+      const results = await Promise.allSettled(
+        batch.map(session =>
+          importSession(opts.apiUrl, session).then(docId => ({ session, docId })),
+        ),
+      )
+      for (const r of results) {
+        if (r.status === 'fulfilled') {
+          globalDocMap.set(r.value.session.sessionId, r.value.docId)
+        } else {
+          totalImportFailures++
+          if (opts.verbose) {
+            log(`  ! import failed: ${(r.reason as Error).message}`)
+          }
+        }
+      }
+      // Progress every 100 sessions
+      const done = Math.min(i + CONCURRENCY, allSessions.length)
+      if (done % 100 === 0 || done === allSessions.length) {
+        log(`  ${done}/${allSessions.length} sessions imported`)
+      }
     }
+    importDurationMs = Date.now() - importStart
+    log(`Import complete: ${globalDocMap.size} sessions in ${(importDurationMs / 1000).toFixed(1)}s (${totalImportFailures} failures)`)
+  }
+
+  // Build reverse map: docId → sessionId (for result matching)
+  const docIdToSessionId = new Map<string, string>()
+  for (const [sid, did] of globalDocMap.entries()) {
+    docIdToSessionId.set(did, sid)
+  }
+
+  // ── Phase 2: Query all questions (search-only, no import overhead) ──
+  log(`\n── Phase 2: Search ──`)
+  log(`Running ${questions.length} queries against ${globalDocMap.size} indexed sessions ...`)
+
+  const outcomes: QuestionOutcome[] = []
+  const notes: string[] = []
+  const searchPhaseStart = Date.now()
+
+  for (let qi = 0; qi < questions.length; qi++) {
+    const q = questions[qi] as NormalisedQuestion
+    const progress = `[${qi + 1}/${questions.length}]`
 
     let searchResults: KnowledgeSearchResultItem[] = []
     const searchStart = Date.now()
     try {
       searchResults = await searchKnowledge(opts.apiUrl, q.question)
     } catch (err) {
-      log(`${progress} — SEARCH FAILED: ${(err as Error).message}`)
+      log(`${progress} ${q.questionId} — SEARCH FAILED: ${(err as Error).message}`)
       outcomes.push({
         questionId: q.questionId,
         questionType: q.questionType,
@@ -784,20 +797,17 @@ async function run(): Promise<number> {
         r_at_5: 0,
         r_at_10: 0,
         ndcg_at_10: 0,
-        importedDocs: docIdBySessionId.size,
-        importFailures,
+        importedDocs: globalDocMap.size,
+        importFailures: 0,
         searchLatencyMs: Date.now() - searchStart,
-        importLatencyMs,
+        importLatencyMs: 0,
         note: 'search_failed',
       })
-      // Best-effort cleanup so the next question starts from a clean slate.
-      await cleanupDocs(opts.apiUrl, [...docIdBySessionId.values()])
       continue
     }
     const searchLatencyMs = Date.now() - searchStart
 
-    // Rank by the order returned (already sorted by hybridScore descending).
-    // Collapse duplicate documentIds while preserving first occurrence.
+    // Collapse duplicate documentIds, preserving first occurrence
     const seen = new Set<string>()
     const rankedDocIds: string[] = []
     for (const hit of searchResults) {
@@ -808,12 +818,7 @@ async function run(): Promise<number> {
       rankedDocIds.push(docId)
     }
 
-    // Translate ranked document IDs back to session IDs by looking up our import map.
-    // Also fall back to the hit title if the mapping isn't found (robust to skipImport).
-    const docIdToSessionId = new Map<string, string>()
-    for (const [sid, did] of docIdBySessionId.entries()) {
-      docIdToSessionId.set(did, sid)
-    }
+    // Map docIds back to sessionIds
     const rankedSessionIds: string[] = []
     for (let i = 0; i < rankedDocIds.length; i++) {
       const did = rankedDocIds[i] as string
@@ -822,11 +827,9 @@ async function run(): Promise<number> {
         rankedSessionIds.push(mapped)
         continue
       }
-      // Fall back to the title returned by search; imports use title=session_id.
       const hit = searchResults[i]
       const title = typeof hit?.title === 'string' ? hit.title : undefined
-      if (title !== undefined) rankedSessionIds.push(title)
-      else rankedSessionIds.push(did)
+      rankedSessionIds.push(title ?? did)
     }
 
     const metrics = computeOutcomeMetrics(q.goldSessionIds, rankedSessionIds)
@@ -840,30 +843,34 @@ async function run(): Promise<number> {
       r_at_5: metrics.r_at_5,
       r_at_10: metrics.r_at_10,
       ndcg_at_10: metrics.ndcg_at_10,
-      importedDocs: docIdBySessionId.size,
-      importFailures,
+      importedDocs: globalDocMap.size,
+      importFailures: 0,
       searchLatencyMs,
-      importLatencyMs,
+      importLatencyMs: 0,
     }
     outcomes.push(outcome)
 
-    const status = outcome.r_at_5 === 1 ? 'SUCCESS R@5' : outcome.r_at_10 === 1 ? 'SUCCESS R@10' : 'MISS'
-    log(
-      `${progress} — ${status} (rank=${outcome.hitRank ?? '-'} ndcg=${outcome.ndcg_at_10.toFixed(3)} imports=${outcome.importedDocs} search=${searchLatencyMs}ms)`,
-    )
-
-    // Remove this question's sessions so that the next question sees a fresh haystack.
-    // LongMemEval is normally scored per-question with its own haystack.
-    await cleanupDocs(opts.apiUrl, [...docIdBySessionId.values()])
+    if (opts.verbose) {
+      const status = outcome.r_at_5 === 1 ? 'HIT@5' : outcome.r_at_10 === 1 ? 'HIT@10' : 'MISS'
+      log(`${progress} ${status} rank=${outcome.hitRank ?? '-'} ${searchLatencyMs}ms`)
+    }
   }
 
-  const finishedAt = Date.now()
+  const searchDurationMs = Date.now() - searchPhaseStart
+  const totalDurationMs = importDurationMs + searchDurationMs
+
+  // ── Phase 3: Cleanup ──
+  log(`\n── Phase 3: Cleanup ──`)
+  await cleanup(opts.apiUrl)
+
+  // ── Compute metrics ──
   const scored = outcomes.filter((o) => o.note === undefined)
   const r5 = average(scored.map((o) => o.r_at_5))
   const r10 = average(scored.map((o) => o.r_at_10))
   const ndcg = average(scored.map((o) => o.ndcg_at_10))
   const mrr = average(scored.map((o) => (o.hitRank !== null ? 1 / o.hitRank : 0)))
   const hitRate = average(scored.map((o) => (o.hitRank !== null ? 1 : 0)))
+  const avgSearchMs = average(scored.map((o) => o.searchLatencyMs))
 
   const perType: Record<string, { count: number; r_at_5: number; r_at_10: number; ndcg_at_10: number }> = {}
   for (const o of scored) {
@@ -889,9 +896,9 @@ async function run(): Promise<number> {
     datasetBytes: datasetSize,
     apiUrl: opts.apiUrl,
     projectId: BENCH_PROJECT_ID,
-    startedAt: new Date(startedAt).toISOString(),
-    finishedAt: new Date(finishedAt).toISOString(),
-    durationMs: finishedAt - startedAt,
+    startedAt: new Date(searchPhaseStart).toISOString(),
+    finishedAt: new Date(searchPhaseStart + searchDurationMs).toISOString(),
+    durationMs: searchDurationMs,
     totalQuestions: outcomes.length,
     scoredQuestions: scored.length,
     skippedQuestions: outcomes.length - scored.length,
@@ -914,6 +921,11 @@ async function run(): Promise<number> {
 
   log('')
   log(renderMarkdown(summary))
+  log('')
+  log(`── Timing Breakdown ──`)
+  log(`  Import:  ${(importDurationMs / 1000).toFixed(1)}s (${globalDocMap.size} sessions, one-time)`)
+  log(`  Search:  ${(searchDurationMs / 1000).toFixed(1)}s (${scored.length} queries, avg ${avgSearchMs.toFixed(0)}ms/query)`)
+  log(`  Total:   ${(totalDurationMs / 1000).toFixed(1)}s`)
   log('')
   log(`Results written to ${resultsPath}`)
   return 0
