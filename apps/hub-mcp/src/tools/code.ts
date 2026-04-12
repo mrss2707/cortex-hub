@@ -72,31 +72,60 @@ export function registerCodeTools(server: McpServer, env: Env) {
 
         let formatted = data?.data?.formatted ?? ''
 
-        // ── P0 Fix: Suggest alternatives when no flows found ──
-        // Repos with 0 execution flows always return empty.
-        // Guide agents to code_context and cypher which work on symbols directly.
+        // ── Auto-fallback: when execution flows are empty, search symbols via cypher ──
         const isEmpty = formatted && (
           formatted.includes('No matching execution flows') ||
           formatted.includes('No matching results found')
         )
-        if (isEmpty) {
-          const searchTerms = query.split(/\s+/).filter(w => w.length > 3).slice(0, 2)
-          const symbolSuggestion = searchTerms[0] ?? query
-          formatted += '\n\n---'
-          formatted += `\nNext: Pick a symbol above and run cortex_code_context "${symbolSuggestion}" to see all its callers, callees, and execution flows.`
-          formatted += `\nAlternative: Use cortex_cypher 'MATCH (n) WHERE n.name CONTAINS "${symbolSuggestion}" RETURN n.name, labels(n) LIMIT 20' for direct graph query.`
-          if (projectId) {
-            formatted += `\nProject routing: Use cortex_list_repos to verify which projectId maps to your repository.`
+
+        if (isEmpty && resolvedProject) {
+          // Extract meaningful search terms from query
+          const searchTerms = query
+            .split(/\s+/)
+            .filter(w => w.length > 2 && !/^(the|and|for|with|from|that|this|how|does|what|where)$/i.test(w))
+            .slice(0, 4)
+
+          // Build cypher query: search Functions, Methods, Classes by name
+          const cypherConditions = searchTerms
+            .map(t => `toLower(n.name) CONTAINS toLower("${t.replace(/"/g, '')}")`)
+            .join(' OR ')
+
+          if (cypherConditions) {
+            try {
+              const cypherRes = await callIntel('cypher', {
+                query: `MATCH (n) WHERE (n:Function OR n:Method OR n:Class OR n:Interface) AND (${cypherConditions}) RETURN DISTINCT n.name AS name, labels(n)[0] AS type, n.file AS file LIMIT 20`,
+                projectId: resolvedProject,
+              })
+
+              const cypherData = cypherRes as { data?: { formatted?: string; row_count?: number } }
+              const rows = cypherData?.data?.row_count ?? 0
+
+              if (rows > 0) {
+                formatted = `Search: "${query}"\n\n`
+                formatted += `Found ${rows} symbol(s) matching your query:\n\n`
+                formatted += cypherData?.data?.formatted ?? ''
+                formatted += '\n\n---'
+                formatted += '\nNext: Run cortex_code_context "<name>" on any symbol above to see callers, callees, and full context.'
+                formatted += '\nOr: Run cortex_code_read with the file path to see the source code.'
+              } else {
+                formatted += '\n\n---'
+                formatted += '\nNo execution flows or symbols found for this query.'
+                formatted += `\nTry: cortex_cypher 'MATCH (n:Function) RETURN n.name LIMIT 30' to browse available symbols.`
+              }
+            } catch {
+              // Cypher fallback is best-effort
+            }
           }
         }
 
-        // ── Qdrant semantic code search: supplement GitNexus with actual source code ──
-        if (projectId) {
+        // ── Qdrant semantic code search: supplement with actual source code ──
+        const resolvedForCodeSearch = resolvedProject
+        if (resolvedForCodeSearch) {
           try {
             const codeRes = await fetch(`${apiUrl()}/api/intel/code-search`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ query, projectId, branch, limit: limit ?? 5 }),
+              body: JSON.stringify({ query, projectId: resolvedForCodeSearch, branch, limit: limit ?? 5 }),
               signal: AbortSignal.timeout(15000),
             })
 
@@ -116,12 +145,11 @@ export function registerCodeTools(server: McpServer, env: Env) {
 
               const codeResults = codeData?.data?.results ?? []
               if (codeResults.length > 0) {
-                const codeLines: string[] = ['\n\n📄 **Source Code Matches** (semantic search)\n']
+                const codeLines: string[] = ['\n\n---\n**Source Code Matches** (semantic search)\n']
                 for (const hit of codeResults.slice(0, 5)) {
                   const score = (hit.score * 100).toFixed(1)
                   codeLines.push(`### ${hit.filePath ?? 'unknown'} (${score}% match)`)
                   if (hit.content) {
-                    // Detect language from file extension
                     const ext = hit.filePath?.split('.').pop() ?? ''
                     const lang = { ts: 'typescript', js: 'javascript', cs: 'csharp', py: 'python', go: 'go', rs: 'rust', java: 'java' }[ext] ?? ext
                     codeLines.push(`\`\`\`${lang}`)
@@ -130,14 +158,12 @@ export function registerCodeTools(server: McpServer, env: Env) {
                   }
                   codeLines.push('')
                 }
-                codeLines.push('💡 Use cortex_code_read to view the full file content.')
+                codeLines.push('Use cortex_code_read to view the full file content.')
                 formatted += codeLines.join('\n')
-              } else if (isEmpty && codeData?.data?.message) {
-                formatted += `\n\n⚠️ ${codeData.data.message}`
               }
             }
           } catch {
-            // Qdrant search is best-effort — don't fail the entire search
+            // Qdrant search is best-effort
           }
         }
 

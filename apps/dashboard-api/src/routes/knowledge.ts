@@ -809,6 +809,106 @@ knowledgeRouter.post('/search', async (c) => {
   }
 })
 
+// ── POST /migrate-clusters — Assign cluster_id to existing docs (no re-embed) ──
+knowledgeRouter.post('/migrate-clusters', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const { projectId } = body as { projectId?: string }
+
+    // Scroll through ALL points in knowledge collection
+    let offset: string | null = null
+    let migrated = 0
+    let clustersCreated = 0
+    let totalPoints = 0
+
+    const scrollFilter = projectId
+      ? { must: [{ key: 'project_id', match: { value: projectId } }] }
+      : undefined
+
+    // Get vector size from first point
+    let vectorSize = 384
+
+    while (true) {
+      const scrollBody: Record<string, unknown> = {
+        limit: 100,
+        with_payload: true,
+        with_vectors: true,
+        filter: scrollFilter,
+      }
+      if (offset) scrollBody.offset = offset
+
+      const res = await fetch(`${QDRANT_URL}/collections/${COLLECTION}/points/scroll`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(scrollBody),
+        signal: AbortSignal.timeout(30000),
+      })
+
+      if (!res.ok) break
+
+      const data = (await res.json()) as {
+        result?: {
+          points?: Array<{
+            id: string
+            vector?: number[]
+            payload?: Record<string, unknown>
+          }>
+          next_page_offset?: string | null
+        }
+      }
+
+      const points = data.result?.points ?? []
+      if (points.length === 0) break
+
+      for (const point of points) {
+        totalPoints++
+        const existingCluster = point.payload?.cluster_id as string | undefined
+        if (existingCluster && existingCluster.length > 0) continue // already has cluster
+
+        const vector = point.vector
+        if (!vector || !Array.isArray(vector)) continue
+
+        vectorSize = vector.length
+        const pointProjectId = (point.payload?.project_id as string) || null
+        const docId = (point.payload?.document_id as string) || point.id
+
+        const clusterId = await assignCluster(vector, docId, pointProjectId).catch(() => null)
+        if (!clusterId) continue
+
+        // Update point payload with cluster_id
+        await fetch(`${QDRANT_URL}/collections/${COLLECTION}/points/payload`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            payload: { cluster_id: clusterId },
+            points: [point.id],
+          }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {})
+
+        if (clusterId.startsWith('cluster-')) clustersCreated++
+        migrated++
+      }
+
+      offset = data.result?.next_page_offset ?? null
+      if (!offset) break
+
+      logger.info(`[migrate-clusters] Progress: ${totalPoints} points scanned, ${migrated} migrated`)
+    }
+
+    return c.json({
+      success: true,
+      totalPoints,
+      migrated,
+      clustersCreated,
+      alreadyClustered: totalPoints - migrated,
+    })
+  } catch (error) {
+    logger.error(`Migrate clusters failed: ${String(error)}`)
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ── GET /lineage/:id — Full DAG traversal ──
 knowledgeRouter.get('/lineage/:id', (c) => {
   const id = c.req.param('id')
